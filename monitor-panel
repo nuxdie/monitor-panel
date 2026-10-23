@@ -1,0 +1,971 @@
+#!/usr/bin/python3
+"""Monitor panel for the xfce4 panel button: every DDC/CI monitor on the desk with brightness up
+front and contrast, colour preset, input, speaker volume, RGB gains and power behind a
+disclosure, plus named profiles (Day / Evening / Night …) that set all monitors in one click.
+
+Talks to the monitors with ddcutil (needs ddcutil and the i2c group; it says what is missing
+otherwise). Monitors are matched to xrandr outputs through their EDID, so each row shows where
+the screen sits on the desk. The bus↔monitor mapping and the monitors' capabilities are cached
+in ~/.cache/monitor-panel so the panel opens instantly; profiles, monitor names and which rows
+are expanded live in ~/.config/monitor-panel/config.json.
+Clicking the panel button again, Escape, or clicking elsewhere closes it.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango
+
+APP_ID = "desk.mochi.MonitorPanel"
+CONFIG = os.path.expanduser("~/.config/monitor-panel/config.json")
+CACHE = os.path.expanduser("~/.cache/monitor-panel")
+SETUP_HINT = "sudo apt install ddcutil\nsudo usermod -aG i2c $USER\nthen log out and back in"
+
+# VCP feature codes (MCCS)
+BRIGHTNESS, CONTRAST, PRESET = "10", "12", "14"
+GAIN_R, GAIN_G, GAIN_B = "16", "18", "1A"
+INPUT, VOLUME, MUTE, POWER = "60", "62", "8D", "D6"
+GAINS = [GAIN_R, GAIN_G, GAIN_B]
+READ_SET = [BRIGHTNESS, CONTRAST, PRESET, *GAINS, INPUT, VOLUME, MUTE, POWER]
+PROFILE_SET = [BRIGHTNESS, CONTRAST, PRESET, *GAINS, VOLUME]   # input and power never go in a profile
+USER_PRESET = 0x0B
+DEFAULT_PROFILES = [{"name": "Day", "any": {BRIGHTNESS: 70}},
+                    {"name": "Evening", "any": {BRIGHTNESS: 35}},
+                    {"name": "Night", "any": {BRIGHTNESS: 10}}]
+
+CSS = b"""
+.mp-card { border-radius: 8px; padding: 6px 10px 8px 10px; background: alpha(currentColor, 0.05); }
+.mp-name { font-weight: bold; padding: 2px 6px; }
+.mp-dim { opacity: 0.55; }
+.mp-chip { padding: 2px 10px; }
+.mp-small { padding: 1px 6px; }
+"""
+
+
+# ---------------------------------------------------------------- helpers: processes & parsing
+
+def ddc_problem():
+    """Why DDC can't work right now, or None."""
+    if not shutil.which("ddcutil"):
+        return "ddcutil isn't installed."
+    buses = [d for d in os.listdir("/dev") if d.startswith("i2c-")]
+    if not buses:
+        return "no /dev/i2c-* (module i2c-dev not loaded)."
+    if not any(os.access(f"/dev/{d}", os.R_OK | os.W_OK) for d in buses):
+        return "no access to /dev/i2c-* (not in group i2c yet)."
+    return None
+
+
+def run_async(argv, done):
+    """Run argv, then call done(stdout text, "" on failure) on the main loop."""
+    try:
+        p = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
+    except GLib.Error:
+        GLib.idle_add(lambda: done("") or False)
+        return
+
+    def finished(proc, result):
+        try:
+            _, out, _ = proc.communicate_utf8_finish(result)
+        except GLib.Error:
+            out = ""
+        done(out or "")
+    p.communicate_utf8_async(None, None, finished)
+
+
+def hexval(tok):
+    return int(tok.lstrip("x"), 16)
+
+
+def parse_vcp(out):
+    """ddcutil getvcp --brief → ({feature: value}, {feature: max}); unsupported features are absent."""
+    vals, maxes = {}, {}
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) < 4 or p[0] != "VCP":
+            continue
+        f, kind = p[1].upper(), p[2]
+        if kind == "C" and len(p) >= 5:
+            vals[f], maxes[f] = int(p[3]), int(p[4])
+        elif kind == "SNC":
+            vals[f] = hexval(p[3])
+        elif kind == "CNC" and len(p) >= 7:
+            maxes[f] = (hexval(p[3]) << 8) | hexval(p[4])
+            vals[f] = (hexval(p[5]) << 8) | hexval(p[6])
+    return vals, maxes
+
+
+def parse_caps(text):
+    """ddcutil capabilities → {feature: [(code, label), …]} ([] for continuous features)."""
+    caps, cur = {}, None
+    for line in text.splitlines():
+        m = re.match(r"\s+Feature: ([0-9A-Fa-f]{2}) \(", line)
+        if m:
+            cur = m.group(1).upper()
+            caps[cur] = []
+            continue
+        if cur is None:
+            continue
+        m = re.match(r"\s+Values: ((?:[0-9a-fA-F]{2}\s+)+)\(interpretation unavailable\)", line)
+        if m:
+            caps[cur] += [(int(h, 16), f"Mode {h}") for h in m.group(1).split()]
+            continue
+        m = re.match(r"\s+([0-9a-fA-F]{2}): (.+)", line)
+        if m:
+            label = m.group(2).strip()
+            if label == "Unrecognized value":
+                label = f"Mode {m.group(1)}"
+            caps[cur].append((int(m.group(1), 16), label))
+    return caps
+
+
+def parse_detect(out):
+    """ddcutil detect → {edid key: {"bus", "model", "connector"}}."""
+    found = {}
+    for block in re.split(r"\n(?=\S)", out):
+        if not block.startswith("Display"):
+            continue           # "Invalid display" = an output without DDC
+        def field(rx):
+            m = re.search(rx, block)
+            return m.group(1).strip() if m else None
+        bus, mfg = field(r"/dev/i2c-(\d+)"), field(r"Mfg id:\s+(\w{3})")
+        if not (bus and mfg):
+            continue
+        product = int(field(r"Product code:\s+(\d+)") or 0)
+        serial = int(field(r"Binary serial number:\s+(\d+)") or 0)
+        found[edid_key(mfg, product, serial)] = {
+            "bus": int(bus), "model": field(r"Model:\s+(.*)") or "",
+            "connector": field(r"DRM connector:\s+(\S+)") or ""}
+    return found
+
+
+def edid_key(mfg, product, serial):
+    return f"{mfg}-{product:04x}-{serial:08x}"
+
+
+def decode_edid(hexstr):
+    """(key, monitor name) from a raw EDID hex dump, or (None, "")."""
+    try:
+        e = bytes.fromhex(hexstr[:256])
+    except ValueError:
+        return None, ""
+    if len(e) < 128:
+        return None, ""
+    v = (e[8] << 8) | e[9]
+    mfg = "".join(chr(((v >> s) & 31) + 64) for s in (10, 5, 0))
+    product = e[10] | (e[11] << 8)
+    serial = e[12] | (e[13] << 8) | (e[14] << 16) | (e[15] << 24)
+    name = ""
+    for i in (54, 72, 90, 108):
+        d = e[i:i + 18]
+        if d[:3] == b"\0\0\0" and d[3] == 0xFC:
+            name = d[5:18].decode("ascii", "ignore").strip(" \n\0")
+    return edid_key(mfg, product, serial), name
+
+
+def read_outputs():
+    """Active xrandr outputs: [{name, w, h, x, y, key, model}] (key None without an EDID)."""
+    try:
+        out = subprocess.run(["xrandr", "--props"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    outputs, cur, in_edid, edid = [], None, False, ""
+    for line in out.splitlines() + ["END"]:
+        if not line.startswith(("\t", " ")):
+            if cur and edid:
+                cur["key"], cur["model"] = decode_edid(edid)
+            cur, in_edid, edid = None, False, ""
+            m = re.match(r"^(\S+) connected(?: primary)? (\d+)x(\d+)\+(\d+)\+(\d+)", line)
+            if m:
+                cur = {"name": m.group(1), "w": int(m.group(2)), "h": int(m.group(3)),
+                       "x": int(m.group(4)), "y": int(m.group(5)), "key": None, "model": ""}
+                outputs.append(cur)
+            continue
+        if cur is None:
+            continue
+        if re.match(r"^\s+EDID:", line):
+            in_edid = True
+            continue
+        if in_edid:
+            m = re.match(r"^\s+([0-9a-fA-F]{32})\s*$", line)
+            if m:
+                edid += m.group(1)
+            else:
+                in_edid = False
+    return outputs
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- the monitors
+
+class Bus:
+    """One i2c bus = one monitor. Calls on a bus are serialised (two ddcutil processes on the same
+    bus trip over each other) and writes are coalesced: a slider drag sends only the latest value
+    per feature, several features in a single ddcutil call, and writes go before queued reads."""
+
+    def __init__(self, n):
+        self.n = n
+        self.queue = []
+        self.pending = {}
+        self.busy = False
+
+    def read(self, features, done):
+        self._enqueue(["getvcp", *features, "--brief"], lambda out: done(*parse_vcp(out)))
+
+    def capabilities(self, done):
+        self._enqueue(["capabilities"], done)
+
+    def write(self, feature, value):
+        self.pending[feature] = int(value)
+        self._pump()
+
+    def _enqueue(self, args, done):
+        self.queue.append((args, done))
+        self._pump()
+
+    def _pump(self):
+        if self.busy:
+            return
+        if self.pending:
+            pairs = [x for f, v in self.pending.items() for x in (f, str(v))]
+            self.pending = {}
+            args, done = ["setvcp", *pairs, "--noverify"], lambda _: None
+        elif self.queue:
+            args, done = self.queue.pop(0)
+        else:
+            return
+        self.busy = True
+
+        def finished(out):
+            self.busy = False
+            done(out)
+            self._pump()
+        run_async(["ddcutil", "--bus", str(self.n), *args], finished)
+
+
+class Monitor:
+    def __init__(self, key, bus=None, model="", connector="", geo=None, output=""):
+        self.key, self.bus, self.model, self.connector = key, bus, model, connector
+        self.output = output                    # xrandr name, e.g. HDMI-1
+        self.x, self.y, self.w, self.h = geo or (0, 0, 0, 0)
+
+    @property
+    def placed(self):
+        return self.w > 0
+
+    def caps_path(self):
+        return os.path.join(CACHE, f"caps-{self.key}.txt")
+
+
+def position_word(m, mons):
+    """Where m sits among mons: left / right / top / bottom / top left …, or ""."""
+    others = [o for o in mons if o is not m and o.placed]
+    if not m.placed or not others:
+        return ""
+    cx, cy = m.x + m.w / 2, m.y + m.h / 2
+    words = []
+    overlapping = [o for o in others if o.x < m.x + m.w and m.x < o.x + o.w]
+    if overlapping:
+        if all(cy < o.y + o.h / 2 for o in overlapping):
+            words.append("top")
+        elif all(cy > o.y + o.h / 2 for o in overlapping):
+            words.append("bottom")
+    if all(cx < o.x + o.w / 2 for o in others):
+        words.append("left")
+    elif all(cx > o.x + o.w / 2 for o in others):
+        words.append("right")
+    return " ".join(words)
+
+
+# ---------------------------------------------------------------- widgets
+
+def icon(name, size=Gtk.IconSize.BUTTON):
+    return Gtk.Image.new_from_icon_name(name, size)
+
+
+def make_scale(maxv=100):
+    s = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, maxv, 1)
+    s.set_value_pos(Gtk.PositionType.RIGHT)
+    s.set_digits(0)
+    s.set_hexpand(True)
+    return s
+
+
+def dim_label(text, xalign=0):
+    lbl = Gtk.Label(label=text, xalign=xalign)
+    lbl.get_style_context().add_class("mp-dim")
+    return lbl
+
+
+class Chooser(Gtk.MenuButton):
+    """A drop-down that stays inside the window (a GtkMenu would steal focus and close the panel)."""
+
+    def __init__(self, options, on_pick, fallback="Custom"):
+        super().__init__()
+        self.options, self.on_pick, self.code, self.fallback = options, on_pick, None, fallback
+        self.lbl = Gtk.Label(label="—", xalign=0)
+        self.lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        box = Gtk.Box(spacing=6)
+        box.pack_start(self.lbl, True, True, 0)
+        box.pack_start(icon("pan-down-symbolic"), False, False, 0)
+        self.add(box)
+        vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        vb.set_border_width(4)
+        self.buttons = {}
+        for code, label in options:
+            b = Gtk.ModelButton(text=label)
+            b.props.role = Gtk.ButtonRole.RADIO
+            b.connect("clicked", self._picked, code)
+            vb.pack_start(b, False, False, 0)
+            self.buttons[code] = b
+        vb.show_all()
+        pop = Gtk.Popover()
+        pop.add(vb)
+        self.set_popover(pop)
+
+    def _picked(self, _b, code):
+        self.get_popover().popdown()
+        if code != self.code:
+            self.set_code(code)
+            self.on_pick(code)
+
+    def set_code(self, code):
+        self.code = code
+        self.lbl.set_text(dict(self.options).get(code, self.fallback))
+        for c, b in self.buttons.items():
+            b.props.active = (c == code)
+
+
+class EntryPopover(Gtk.Popover):
+    """Popover with a prompt, an entry and a confirm button; on_done(text) when confirmed."""
+
+    def __init__(self, relative_to, prompt, button, on_done, text="", extra=()):
+        super().__init__(relative_to=relative_to)
+        vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        vb.set_border_width(8)
+        vb.pack_start(dim_label(prompt), False, False, 0)
+        row = Gtk.Box(spacing=6)
+        self.entry = Gtk.Entry(text=text)
+        self.entry.set_width_chars(16)
+        ok = Gtk.Button(label=button)
+        ok.get_style_context().add_class("suggested-action")
+        row.pack_start(self.entry, True, True, 0)
+        row.pack_start(ok, False, False, 0)
+        vb.pack_start(row, False, False, 0)
+        for label, cb in extra:
+            b = Gtk.ModelButton(text=label)
+            b.connect("clicked", lambda _b, cb=cb: (self.popdown(), cb()))
+            vb.pack_start(b, False, False, 0)
+        vb.show_all()
+        self.add(vb)
+
+        def confirm(*_):
+            self.popdown()
+            on_done(self.entry.get_text().strip())
+        ok.connect("clicked", confirm)
+        self.entry.connect("activate", confirm)
+
+    def show(self):
+        self.popup()
+        self.entry.grab_focus()
+
+
+class MiniMap(Gtk.DrawingArea):
+    """The desk's monitor layout, this monitor filled in."""
+
+    def __init__(self, panel, mon):
+        super().__init__()
+        self.panel, self.mon = panel, mon
+        self.set_size_request(44, 24)
+        self.set_valign(Gtk.Align.CENTER)
+        self.connect("draw", self.on_draw)
+
+    def on_draw(self, w, cr):
+        mons = [m for m in self.panel.monitors if m.placed]
+        if not mons:
+            return
+        ctx = w.get_style_context()
+        fg = ctx.lookup_color("theme_fg_color")[1]
+        sel = ctx.lookup_color("theme_selected_bg_color")[1]
+        W, H = w.get_allocated_width(), w.get_allocated_height()
+        x0, y0 = min(m.x for m in mons), min(m.y for m in mons)
+        bw = max(m.x + m.w for m in mons) - x0
+        bh = max(m.y + m.h for m in mons) - y0
+        k = min((W - 2) / bw, (H - 2) / bh)
+        ox, oy = (W - bw * k) / 2, (H - bh * k) / 2
+        for m in mons:
+            cr.rectangle(ox + (m.x - x0) * k + 0.5, oy + (m.y - y0) * k + 0.5,
+                         max(m.w * k - 1, 1), max(m.h * k - 1, 1))
+            if m is self.mon:
+                cr.set_source_rgba(sel.red, sel.green, sel.blue, 1)
+                cr.fill()
+            else:
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.22)
+                cr.fill()
+
+
+class MonitorRow(Gtk.Box):
+    """One monitor: name + minimap + brightness, and the rest under a disclosure."""
+
+    def __init__(self, panel, mon):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.panel, self.mon = panel, mon
+        self.values, self.maxes, self.caps = {}, {}, None
+        self.controls = {}          # feature → Scale / Chooser / ToggleButton
+        self.guard = False
+        self.get_style_context().add_class("mp-card")
+
+        head = Gtk.Box(spacing=6)
+        head.pack_start(MiniMap(panel, mon), False, False, 0)
+        self.name_btn = Gtk.Button()
+        self.name_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.name_lbl = Gtk.Label(xalign=0)
+        self.name_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        self.name_lbl.get_style_context().add_class("mp-name")
+        self.name_btn.add(self.name_lbl)
+        self.name_btn.set_tooltip_text("Rename this monitor")
+        self.name_btn.connect("clicked", self.rename)
+        head.pack_start(self.name_btn, False, False, 0)
+        where = " · ".join(x for x in (position_word(mon, panel.monitors), mon.output) if x)
+        head.pack_start(dim_label(where), True, True, 0)
+        self.expander = Gtk.ToggleButton()
+        self.expander.set_relief(Gtk.ReliefStyle.NONE)
+        self.expander.add(icon("pan-end-symbolic"))
+        self.expander.set_tooltip_text("More settings")
+        self.expander.connect("toggled", self.toggled)
+        head.pack_end(self.expander, False, False, 0)
+        self.pack_start(head, False, False, 0)
+        self.refresh_name()
+
+        row = Gtk.Box(spacing=8)
+        row.pack_start(icon("display-brightness-symbolic"), False, False, 4)
+        self.brightness = self.add_scale(BRIGHTNESS)
+        row.pack_start(self.brightness, True, True, 0)
+        self.pack_start(row, False, False, 0)
+
+        self.revealer = Gtk.Revealer()
+        self.revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self.pack_start(self.revealer, False, False, 0)
+        if mon.key in panel.config.get("expanded", []):
+            self.expander.set_active(True)
+
+    # --- building
+    def add_scale(self, feature, maxv=100):
+        s = make_scale(maxv)
+        s.set_sensitive(False)
+        s.connect("value-changed", self.on_scale, feature)
+        self.controls[feature] = s
+        return s
+
+    def build_details(self, caps):
+        self.caps = caps
+        grid = Gtk.Grid(column_spacing=10, row_spacing=4)
+        grid.set_margin_top(4)
+        r = 0
+
+        def label(text):
+            grid.attach(dim_label(text, xalign=1), 0, r, 1, 1)
+
+        if CONTRAST in caps:
+            label("Contrast")
+            grid.attach(self.add_scale(CONTRAST), 1, r, 1, 1)
+            r += 1
+        choosers = Gtk.Box(spacing=8, homogeneous=True)
+        if caps.get(PRESET):
+            ch = Chooser(caps[PRESET], lambda code: self.on_pick(PRESET, code))
+            ch.set_tooltip_text("Colour preset")
+            self.controls[PRESET] = ch
+            choosers.pack_start(ch, True, True, 0)
+        if caps.get(INPUT):
+            ch = Chooser(caps[INPUT], lambda code: self.on_pick(INPUT, code), fallback="Unknown")
+            ch.set_tooltip_text("Input source")
+            self.controls[INPUT] = ch
+            choosers.pack_start(ch, True, True, 0)
+        if choosers.get_children():
+            label("Colour · Input" if len(choosers.get_children()) == 2 else
+                  "Colour" if PRESET in self.controls else "Input")
+            grid.attach(choosers, 1, r, 1, 1)
+            r += 1
+        if VOLUME in caps:
+            label("Volume")
+            vol = Gtk.Box(spacing=4)
+            vol.pack_start(self.add_scale(VOLUME), True, True, 0)
+            if MUTE in caps:
+                mute = Gtk.ToggleButton()
+                mute.set_relief(Gtk.ReliefStyle.NONE)
+                mute.add(icon("audio-volume-muted-symbolic"))
+                mute.set_tooltip_text("Mute")
+                mute.connect("toggled", self.on_mute)
+                vol.pack_start(mute, False, False, 0)
+                self.controls[MUTE] = mute
+            grid.attach(vol, 1, r, 1, 1)
+            r += 1
+        if all(g in caps for g in GAINS):
+            label("RGB gains")
+            gains = Gtk.Box(spacing=4)
+            for g in GAINS:
+                gains.pack_start(self.add_scale(g), True, True, 0)
+                self.controls[g].set_value_pos(Gtk.PositionType.BOTTOM)
+            grid.attach(gains, 1, r, 1, 1)
+            r += 1
+        if POWER in caps:
+            label("Power")
+            off = Gtk.Button(label="Turn off screen")
+            off.get_style_context().add_class("mp-small")
+            off.set_halign(Gtk.Align.START)
+            off.set_tooltip_text("Switches this monitor off (DDC power mode). Wake it with its own power button.")
+            off.connect("clicked", lambda *_: self.mon.bus.write(POWER, 4))
+            grid.attach(off, 1, r, 1, 1)
+            r += 1
+        grid.show_all()
+        old = self.revealer.get_child()
+        if old:
+            self.revealer.remove(old)
+        self.revealer.add(grid)
+        self.apply_values()
+
+    # --- values
+    def set_values(self, vals, maxes):
+        self.values.update(vals)
+        self.maxes.update(maxes)
+        self.apply_values()
+        self.panel.values_changed()
+
+    def apply_values(self):
+        """Push known values into the controls without writing anything."""
+        self.guard = True
+        try:
+            for f, w in self.controls.items():
+                known = f in self.values
+                w.set_sensitive(known)
+                if not known:
+                    continue
+                v = self.values[f]
+                if isinstance(w, Gtk.Scale):
+                    if self.maxes.get(f, 100) != int(w.get_adjustment().get_upper()):
+                        w.set_range(0, self.maxes.get(f, 100))
+                    w.set_value(v)
+                elif isinstance(w, Chooser):
+                    w.set_code(v)
+                elif f == MUTE:
+                    w.set_active(v == 1)
+        finally:
+            self.guard = False
+
+    def set_feature(self, f, v, write=True):
+        """Used by profiles and the All slider: show v and send it if it differs."""
+        if write and self.values.get(f) != v and self.mon.bus:
+            self.mon.bus.write(f, v)
+        self.values[f] = v
+        self.apply_values()
+
+    def on_scale(self, scale, f):
+        if self.guard:
+            return
+        self.values[f] = int(scale.get_value())
+        self.mon.bus.write(f, self.values[f])
+        if f in GAINS:          # touching a gain flips many monitors into their User preset
+            self.mon.bus.read([PRESET], lambda vals, _m: self.set_values(vals, {}))
+        self.panel.values_changed()
+
+    def on_pick(self, f, code):
+        self.values[f] = code
+        self.mon.bus.write(f, code)
+        self.panel.values_changed()
+
+    def on_mute(self, btn):
+        if self.guard:
+            return
+        self.values[MUTE] = 1 if btn.get_active() else 2
+        self.mon.bus.write(MUTE, self.values[MUTE])
+
+    def snapshot(self):
+        """Profile entry for this monitor: the values worth restoring. RGB gains only when the
+        monitor is in its User preset, because writing gains flips the preset to User."""
+        feats = [f for f in PROFILE_SET if f in self.values and (self.caps is None or f in self.caps)]
+        if self.values.get(PRESET) not in (None, USER_PRESET):
+            feats = [f for f in feats if f not in GAINS]
+        return {f: self.values[f] for f in feats}
+
+    # --- header actions
+    def display_name(self):
+        return self.panel.config.get("names", {}).get(self.mon.key) or self.mon.model or self.mon.output or "Monitor"
+
+    def refresh_name(self):
+        self.name_lbl.set_text(self.display_name())
+
+    def rename(self, *_):
+        def done(text):
+            names = self.panel.config.setdefault("names", {})
+            if text:
+                names[self.mon.key] = text
+            else:
+                names.pop(self.mon.key, None)
+            self.panel.save_config()
+            self.refresh_name()
+        EntryPopover(self.name_btn, "Name for this monitor (empty = model name)", "Rename",
+                     done, text=self.panel.config.get("names", {}).get(self.mon.key, "")).show()
+
+    def toggled(self, btn):
+        on = btn.get_active()
+        btn.get_child().set_from_icon_name("pan-down-symbolic" if on else "pan-end-symbolic",
+                                           Gtk.IconSize.BUTTON)
+        self.revealer.set_reveal_child(on)
+        expanded = set(self.panel.config.get("expanded", []))
+        (expanded.add if on else expanded.discard)(self.mon.key)
+        self.panel.config["expanded"] = sorted(expanded)
+        self.panel.save_config()
+
+
+# ---------------------------------------------------------------- the panel
+
+class Panel(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+        self.win = None
+        self.closed_at = 0
+        self.monitors, self.rows, self.buses = [], [], {}
+        self.config = load_json(CONFIG, {})
+        self.config.setdefault("profiles", DEFAULT_PROFILES)
+
+    def do_activate(self):
+        if self.win is not None:          # second click on the panel button: close
+            self.close()
+            return
+        if time.monotonic() - self.closed_at < 0.4:
+            return                        # the click that took focus away already closed it
+        self.build()
+
+    def save_config(self):
+        try:
+            save_json(CONFIG, self.config)
+        except OSError:
+            pass
+
+    # --- window
+    def build(self):
+        self.hold()
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        win = self.win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_title("Monitors")
+        win.set_decorated(False)
+        win.set_skip_taskbar_hint(True)
+        win.set_skip_pager_hint(True)
+        win.set_keep_above(True)
+        win.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        win.set_resizable(False)
+        # Close on clicking elsewhere, but only once it has had focus: xfwm4 may map it unfocused
+        # (focus-stealing prevention), and that first focus-out must not kill it.
+        self.had_focus = False
+        win.connect("focus-in-event", lambda *_: setattr(self, "had_focus", True))
+        win.connect("focus-out-event", lambda *_: self.had_focus and self.close())
+        win.connect("key-press-event",
+                    lambda w, e: self.close() if e.keyval == Gdk.KEY_Escape else None)
+        win.connect("size-allocate", lambda *_: self.place())
+
+        frame = Gtk.Frame()
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.box.set_border_width(10)
+        self.box.set_size_request(430, -1)
+        frame.add(self.box)
+        win.add(frame)
+
+        head = Gtk.Box(spacing=6)
+        title = Gtk.Label(xalign=0)
+        title.set_markup("<b>Monitors</b>")
+        head.pack_start(title, False, False, 4)
+        self.profile_bar = Gtk.Box()
+        self.profile_bar.get_style_context().add_class("linked")
+        head.pack_end(self.profile_bar, False, False, 0)
+        self.box.pack_start(head, False, False, 0)
+
+        self.rows_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        scroller = Gtk.ScrolledWindow()      # four expanded rows outgrow a 1080-high screen
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_propagate_natural_height(True)
+        scroller.set_overlay_scrolling(True)
+        scroller.add(self.rows_box)
+        self.box.pack_start(scroller, True, True, 0)
+
+        foot = Gtk.Box(spacing=8)
+        foot.pack_start(dim_label("All"), False, False, 4)
+        self.all_scale = make_scale()
+        self.all_scale.set_sensitive(False)
+        self.all_scale.set_tooltip_text("Brightness of every monitor at once")
+        self.all_scale.connect("value-changed", self.on_all)
+        foot.pack_start(self.all_scale, True, True, 0)
+        refresh = Gtk.Button()
+        refresh.set_relief(Gtk.ReliefStyle.NONE)
+        refresh.add(icon("view-refresh-symbolic"))
+        refresh.set_tooltip_text("Re-detect monitors and re-read their settings")
+        refresh.connect("clicked", lambda *_: self.detect(force=True))
+        foot.pack_end(refresh, False, False, 0)
+        self.box.pack_start(foot, False, False, 0)
+        self.guard = False
+        self.note_lbl = None
+
+        display = Gdk.Display.get_default()
+        _, px, py = display.get_default_seat().get_pointer().get_position()
+        self.anchor = (px, py)
+        screen_h = display.get_monitor_at_point(px, py).get_geometry().height
+        scroller.set_max_content_height(screen_h - 150)
+        self.build_profile_bar()
+
+        problem = ddc_problem()
+        if problem:
+            self.note(f"{problem}\nOne-time setup:\n{SETUP_HINT}", selectable=True)
+        else:
+            self.detect()
+        win.show_all()
+        self.place()
+        win.present()
+
+    def note(self, text, selectable=False):
+        if self.note_lbl:
+            self.note_lbl.destroy()
+        self.note_lbl = Gtk.Label(label=text, xalign=0)
+        self.note_lbl.set_selectable(selectable)
+        self.note_lbl.get_style_context().add_class("mp-dim")
+        self.rows_box.pack_start(self.note_lbl, False, False, 0)
+        self.note_lbl.show()
+
+    def place(self):
+        # Open by the pointer (that is where the panel button is), kept inside its monitor.
+        if self.win is None:
+            return
+        px, py = self.anchor
+        display = Gdk.Display.get_default()
+        geo = display.get_monitor_at_point(px, py).get_geometry()
+        nat = self.win.get_preferred_size()[1]
+        w, h = nat.width, nat.height
+        x = min(max(px - w // 2, geo.x), geo.x + geo.width - w)
+        y = max(py - h - 24, geo.y) if py > geo.y + geo.height / 2 else py + 24
+        y = min(y, geo.y + geo.height - h)
+        self.win.move(x, y)
+
+    def close(self):
+        if self.win is None:
+            return
+        self.win.destroy()
+        self.win = None
+        self.closed_at = time.monotonic()
+        # Linger briefly so a ddcutil write still in flight finishes and a quick re-click is seen.
+        GLib.timeout_add(1500, lambda: self.release() or False)
+
+    # --- monitors
+    def detect(self, force=False):
+        """Monitors from the cached bus map when every active output is in it, else ddcutil detect."""
+        outputs = read_outputs()
+        cache = load_json(os.path.join(CACHE, "buses.json"), {})
+        keys = {o["key"] for o in outputs if o["key"]}
+        if not force and cache and keys and keys <= set(cache):
+            self.populate({k: cache[k] for k in keys}, outputs)
+            return
+        self.note("looking for monitors…")
+
+        def found(out):
+            if self.win is None:
+                return
+            ddc = parse_detect(out)
+            if ddc:
+                try:
+                    save_json(os.path.join(CACHE, "buses.json"), {**cache, **ddc})
+                except OSError:
+                    pass
+            self.populate(ddc, outputs)
+        run_async(["ddcutil", "detect"], found)
+
+    def populate(self, ddc, outputs):
+        for row in self.rows:
+            row.destroy()
+        if self.note_lbl:
+            self.note_lbl.destroy()
+            self.note_lbl = None
+        self.monitors, self.rows = [], []
+        by_key = {o["key"]: o for o in outputs if o["key"]}
+        for key, d in ddc.items():
+            o = by_key.get(key)
+            bus = self.buses.setdefault(d["bus"], Bus(d["bus"]))
+            self.monitors.append(Monitor(
+                key, bus, (o and o["model"]) or d.get("model") or "", d.get("connector", ""),
+                (o["x"], o["y"], o["w"], o["h"]) if o else None, o["name"] if o else ""))
+        for o in outputs:                   # outputs without DDC still take part in the minimap
+            if o["key"] not in ddc:
+                self.monitors.append(Monitor(o["key"] or o["name"], None, o["model"], "",
+                                             (o["x"], o["y"], o["w"], o["h"]), o["name"]))
+        self.monitors.sort(key=lambda m: (not m.placed, m.x + m.w / 2, m.y + m.h / 2))
+        for m in self.monitors:
+            if m.bus is None:
+                continue
+            row = MonitorRow(self, m)
+            self.rows.append(row)
+            self.rows_box.pack_start(row, False, False, 0)
+            self.load_caps(row)
+            feats = [f for f in READ_SET if row.caps is None or f in row.caps]
+            m.bus.read(feats, row.set_values)
+        if not self.rows:
+            self.note("no DDC monitors found\n(DDC/CI may be off in a monitor's own menu)")
+        self.rows_box.show_all()
+        self.values_changed()
+
+    def load_caps(self, row):
+        path = row.mon.caps_path()
+        try:
+            with open(path) as f:
+                row.build_details(parse_caps(f.read()))
+            return
+        except OSError:
+            pass
+
+        def got(text):
+            caps = parse_caps(text)
+            if not caps or row.get_parent() is None:
+                return
+            try:
+                os.makedirs(CACHE, exist_ok=True)
+                with open(path, "w") as f:
+                    f.write(text)
+            except OSError:
+                pass
+            row.build_details(caps)
+        row.mon.bus.capabilities(got)
+
+    # --- the All slider
+    def on_all(self, scale):
+        if self.guard:
+            return
+        v = int(scale.get_value())
+        for row in self.rows:
+            if BRIGHTNESS in row.values:
+                row.set_feature(BRIGHTNESS, v)
+        self.values_changed()
+
+    def values_changed(self):
+        if self.win is None:
+            return
+        known = [r.values[BRIGHTNESS] for r in self.rows if BRIGHTNESS in r.values]
+        self.guard = True
+        try:
+            self.all_scale.set_sensitive(bool(known))
+            if known:
+                self.all_scale.set_value(round(sum(known) / len(known)))
+        finally:
+            self.guard = False
+        for chip, profile in self.chips:
+            ctx = chip.get_style_context()
+            if self.profile_matches(profile):
+                ctx.add_class("suggested-action")
+            else:
+                ctx.remove_class("suggested-action")
+
+    # --- profiles
+    def profile_entry(self, profile, row):
+        return profile.get("monitors", {}).get(row.mon.key) or profile.get("any")
+
+    def profile_matches(self, profile):
+        covered = False
+        for row in self.rows:
+            entry = self.profile_entry(profile, row)
+            if not entry:
+                continue
+            covered = True
+            for f, v in entry.items():
+                if f not in row.values or row.values[f] != v:
+                    return False
+        return covered
+
+    def apply_profile(self, profile):
+        for row in self.rows:
+            entry = self.profile_entry(profile, row)
+            if not entry:
+                continue
+            for f in PROFILE_SET:           # brightness/contrast/preset before gains
+                if f in entry and (row.caps is None or f in row.caps):
+                    row.set_feature(f, int(entry[f]))
+        self.values_changed()
+
+    def build_profile_bar(self):
+        for c in self.profile_bar.get_children():
+            c.destroy()
+        self.chips = []
+        for profile in self.config["profiles"]:
+            chip = Gtk.Button(label=profile["name"])
+            chip.get_style_context().add_class("mp-chip")
+            chip.set_tooltip_text("Apply · right-click to edit")
+            chip.connect("clicked", lambda _b, p=profile: self.apply_profile(p))
+            chip.connect("button-press-event", self.chip_pressed, profile)
+            self.profile_bar.pack_start(chip, False, False, 0)
+            self.chips.append((chip, profile))
+        add = Gtk.Button()
+        add.add(icon("list-add-symbolic"))
+        add.set_tooltip_text("Save the current settings as a new profile")
+        add.connect("clicked", self.add_profile)
+        self.profile_bar.pack_start(add, False, False, 0)
+        self.profile_bar.show_all()
+        self.values_changed()
+
+    def add_profile(self, btn):
+        def done(name):
+            if not name:
+                return
+            self.config["profiles"] = [p for p in self.config["profiles"] if p["name"] != name]
+            self.config["profiles"].append({"name": name, "monitors": self.snapshot()})
+            self.save_config()
+            self.build_profile_bar()
+        EntryPopover(btn, "Save the current settings as", "Save", done).show()
+
+    def snapshot(self):
+        return {row.mon.key: row.snapshot() for row in self.rows if row.snapshot()}
+
+    def chip_pressed(self, chip, event, profile):
+        if event.button != 3:
+            return False
+
+        def rename(name):
+            if name:
+                profile["name"] = name
+                self.save_config()
+                self.build_profile_bar()
+
+        def update():
+            profile.pop("any", None)
+            profile["monitors"] = self.snapshot()
+            self.save_config()
+            self.values_changed()
+
+        def delete():
+            self.config["profiles"].remove(profile)
+            self.save_config()
+            self.build_profile_bar()
+        EntryPopover(chip, "Profile name", "Rename", rename, text=profile["name"],
+                     extra=[("Update with the current settings", update),
+                            ("Delete this profile", delete)]).show()
+        return True
+
+
+if __name__ == "__main__":
+    Panel().run(None)

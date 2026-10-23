@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Monitors
+Comment=Brightness, colour, input and profiles for each monitor
+Exec=monitor-panel
+Icon=display-brightness-symbolic
+Terminal=false
+StartupNotify=false
+X-XFCE-Source=file://monitor-panel
