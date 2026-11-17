@@ -1,0 +1,450 @@
+#!/usr/bin/python3
+"""Ambient brightness service and local CLI for the monitor panel."""
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import signal
+import socketserver
+import sys
+import threading
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from ambient import (CONFIG, STATUS, OVERRIDES, SOCKET, RUNTIME, STATE_DIR, LEVELS, PHASES,
+                     LightSources, command, ddc, load, save, request, light_level,
+                     stepped, targets, vcp_values, add_match)
+from gamma_control import ShadowLift, recover
+from monitor_hardware import read_outputs, parse_detect
+
+
+def contrast_quirk(key):
+    """A monitor whose firmware mishandles remote contrast, from config.json:
+    "quirks": {"<monitor key>": {"12": {"max": 22, "auto": 0, "shown_offset": 78}}}.
+    max: the highest value that may be sent; auto: what automatic contrast means there."""
+    return load(CONFIG).get('quirks', {}).get(key, {}).get('12', {})
+
+
+DEFAULT_SHADOWS = 40
+MODES = ('movie', 'game')
+
+
+class Engine:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.changed = threading.Event()
+        self.stop = threading.Event()
+        self.settings = load(OVERRIDES, {'monitors': {}})
+        self.settings.setdefault('monitors', {})
+        if 'shadows' not in self.settings:
+            # Older settings stored a gamma exponent (1.0–2.5); 1.4 lifted near-black
+            # about as much as 40 does now.
+            old = self.settings.get('gamma')
+            self.settings['shadows'] = (DEFAULT_SHADOWS if old is None else
+                                        max(0, min(100, round((float(old) - 1) * 100))))
+        self.settings.pop('gamma', None)
+        self.settings.setdefault('match', {})
+        self.settings['levels'] = {p: self.settings.get('levels', {}).get(p, LEVELS[p]) for p in PHASES}
+        self.last_warmth = 0
+        self.light = LightSources()
+        self.level = None           # the automatic level in force, a whole percent
+        self.maxes = {}             # monitor key → {feature: raw maximum}, from the last read
+        self.gamma = ShadowLift()
+        self.status = {'ready': False, 'errors': [], 'monitors': {}}
+        self.devices = {}
+        self.layout = None
+        self.discovered_at = 0
+        self.last_ramp_step = 0
+        self.revision = 0
+        self.snap_keys = set()
+
+    def handle(self, payload):
+        with self.lock:
+            operation = payload.get('op')
+            main = load(CONFIG).get('ambient', {}).get('main_monitor')
+            if operation == 'status':
+                return self.status
+            monitors = self.settings['monitors']
+            if operation == 'mode':
+                # A mode belongs to the main monitor. Other monitors' pinned levels stay.
+                mode = payload.get('mode')
+                if mode == 'auto':
+                    if monitors.get(main, {}).get('mode') in MODES:
+                        del monitors[main]
+                        self.snap_keys.add(main)
+                elif mode in MODES:
+                    if not main:
+                        raise ValueError('Main monitor not configured')
+                    monitors[main] = {'mode': mode}
+                    self.snap_keys.add(main)
+                else:
+                    raise ValueError('Unknown mode')
+            elif operation == 'release':
+                # Unpin: hand one monitor (or all of them) back to automatic brightness.
+                keys = list(monitors) if payload.get('key') == 'all' else [payload.get('key')]
+                for key in keys:
+                    entry = monitors.get(key)
+                    if not entry:
+                        continue
+                    if entry.get('mode') in MODES:
+                        entry.pop('values', None)      # keep Movie/Game, drop its tuning
+                    else:
+                        del monitors[key]
+                    self.snap_keys.add(key)
+            elif operation == 'set':
+                values = payload.get('values', {})
+                if not values or any(f not in ('10', '12') or type(v) is not int or not 0 <= v <= 100
+                                     for f, v in values.items()):
+                    raise ValueError('Expected brightness/contrast percentages from 0 to 100')
+                keys = list(self.devices) if payload.get('key') == 'all' else [payload.get('key')]
+                if not keys or any(k not in self.devices for k in keys):
+                    raise ValueError('Monitor is not connected')
+                applied = []
+                for key in keys:
+                    old = monitors.get(key, {})
+                    # Editing the brightness/contrast inside Movie or Game keeps that mode.
+                    mode = old.get('mode', 'manual')
+                    mine = dict(values)
+                    if '12' in mine:
+                        mine['12'] = min(mine['12'], contrast_quirk(key).get('max', 100))
+                    monitors[key] = {'mode': mode, 'values': {**old.get('values', {}), **mine}}
+                    self.snap_keys.add(key)
+                    applied.append((key, mine))
+            elif operation == 'levelset':
+                # The All track: one brightness per monitor in a single request.
+                table = payload.get('monitors', {})
+                if not table or any(k not in self.devices or type(v) is not int or not 0 <= v <= 100
+                                    for k, v in table.items()):
+                    raise ValueError('Expected a brightness from 0 to 100 for connected monitors')
+                for key, value in table.items():
+                    old = monitors.get(key, {})
+                    monitors[key] = {'mode': old.get('mode', 'manual'),
+                                     'values': {**old.get('values', {}), '10': value}}
+                    self.snap_keys.add(key)
+            elif operation == 'hold':
+                for key, values in payload.get('monitors', {}).items():
+                    if key in self.devices:
+                        monitors[key] = {'mode': 'manual', 'values': {
+                            f: int(v) for f, v in values.items() if f in ('10', '12') and 0 <= int(v) <= 100}}
+                        self.snap_keys.add(key)
+            elif operation == 'match':
+                # "These look equally bright": remember each monitor's value against the
+                # main monitor's, so automatic levels look the same on all of them.
+                table = self.settings['match']
+                if 'forget' in payload:
+                    for key in (list(table) if payload['forget'] == 'all' else [payload['forget']]):
+                        table.pop(key, None)
+                        self.snap_keys.add(key)
+                else:
+                    level, points = payload.get('level'), payload.get('points', {})
+                    valid = lambda v: type(v) is int and 0 <= v <= 100
+                    if not main or not valid(level) or not points or not all(map(valid, points.values())):
+                        raise ValueError('Expected the main level and each monitor\'s value, 0 to 100')
+                    main_pinned = main in monitors
+                    for key, value in points.items():
+                        if key == main or key not in self.devices:
+                            continue
+                        table[key] = add_match(table.get(key), level, value)
+                        # With main on automatic the match replaces the hand-set pin.
+                        if not main_pinned and monitors.get(key, {}).get('mode') == 'manual':
+                            del monitors[key]
+                        self.snap_keys.add(key)
+            elif operation == 'levels':
+                # The four anchors of the day curve, darkest to brightest.
+                values = payload.get('values', {})
+                if set(values) != set(PHASES) or any(
+                        type(v) is not int or not 0 <= v <= 100 for v in values.values()):
+                    raise ValueError('Expected Night, Evening, Dusk and Day levels from 0 to 100')
+                floor = 0
+                for phase in PHASES:            # brighter light never means a darker screen
+                    floor = self.settings['levels'][phase] = max(floor, values[phase])
+                self.level = None
+                self.snap_keys.update(self.devices)
+            elif operation == 'shadows':
+                value = payload.get('value')
+                if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 100:
+                    raise ValueError('Shadows must be between 0 and 100')
+                self.settings['shadows'] = round(value)
+            else:
+                raise ValueError('Unknown operation')
+            save(OVERRIDES, self.settings)
+            errors = []
+            if operation in ('shadows', 'mode') and self.devices:
+                # Immediate: do not wait for an in-flight tick (sensor poll, DDC) to finish.
+                errors, _ = self.shadow_lift(main)
+            self.revision += 1
+            self.changed.set()
+            # The panel reads the status file; show the new choice before the next round ends.
+            self.status.update({'pending': True, 'requested_revision': self.revision,
+                                'overrides': json.loads(json.dumps(monitors)),
+                                'shadows': self.settings['shadows'],
+                                'levels': dict(self.settings['levels']),
+                                'match': json.loads(json.dumps(self.settings['match']))})
+            if self.status.get('updated_at'):
+                save(STATUS, self.status)
+            result = {'accepted': True, 'revision': self.revision, 'errors': errors}
+            # Sent to the monitors right away by apply_now(), outside this lock.
+            if operation == 'set':
+                result['_apply'] = applied
+            elif operation == 'levelset':
+                result['_apply'] = [(key, {'10': value}) for key, value in table.items()]
+            return result
+
+    def apply_now(self, items):
+        """A slider moved: write it to the monitor at once instead of waiting for a round.
+        The service is the only writer, so nothing can push an older value back."""
+        def write(key, values):
+            device = self.devices.get(key)
+            if not device:
+                return
+            maxes = self.maxes.get(key, {})
+            try:
+                # One feature per call: the HKC silently drops a feature from a combined
+                # write. Short protocol pauses, because a slider should be felt at once;
+                # measured here about one such write in thirty fails on one monitor, so a
+                # failure is repeated at normal pace, and the round that follows reads the
+                # value back in any case.
+                for f, v in values.items():
+                    raw = round(v * maxes.get(f, 100) / 100)
+                    try:
+                        ddc(device['bus'], '--sleep-multiplier', '.2', 'setvcp', f, raw, '--noverify')
+                    except Exception:
+                        ddc(device['bus'], 'setvcp', f, raw, '--noverify')
+            except Exception as e:      # the following round reads back and reports
+                print(f'ambient: immediate write to {key}: {e}', file=sys.stderr, flush=True)
+        threads = [threading.Thread(target=write, args=item) for item in items]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    def discover(self, outputs):
+        layout = [(o['name'], o['key']) for o in outputs]
+        if layout != self.layout or time.monotonic() - self.discovered_at > 300:
+            detected = parse_detect(command(['ddcutil', 'detect'], timeout=40))
+            # Only live EDID matches are eligible. Never write through a stale bus map.
+            self.devices = {o['key']: {**detected[o['key']], **o}
+                            for o in outputs if o['key'] in detected}
+            self.layout = layout
+            self.discovered_at = time.monotonic()
+            save(Path.home() / '.cache/monitor-panel/buses.json', detected)
+
+    def apply_monitor(self, item, target, ramp_step, snap=False, stale=lambda: False):
+        key, device = item
+        desired = {f: target[f] for f in ('10', '12')}
+        values = vcp_values(ddc(device['bus'], 'getvcp', '10', '12', '--brief'))
+        missing = [f for f in desired if f not in values]
+        if missing:
+            raise RuntimeError(f'{device["model"]}: brightness/contrast read failed ({missing})')
+        self.maxes[key] = {f: values[f][1] for f in desired}
+        writing = {}
+        for feature, percentage in desired.items():
+            current, maximum = values[feature]
+            wanted = round(percentage * maximum / 100)
+            if feature == '10' and target['mode'] == 'auto' and not snap:
+                wanted = stepped(current, wanted, max(1, round(maximum * .02))) if ramp_step else current
+            if current != wanted:
+                writing[feature] = wanted
+        # A request that arrived while this round was reading makes its targets old news:
+        # write nothing, the next round starts at once with the new ones.
+        if writing and not stale():
+            for f, v in writing.items():    # one feature per call, see apply_now()
+                ddc(device['bus'], 'setvcp', f, v)
+            # Read actual values back; command delivery alone is not success.
+            values = vcp_values(ddc(device['bus'], 'getvcp', '10', '12', '--brief'))
+            for feature, wanted in writing.items():
+                if (feature not in values or values[feature][0] != wanted) and not stale():
+                    raise RuntimeError(f'{device["model"]}: {feature} readback differs from requested {wanted}')
+        actual = {f: round(values[f][0] / values[f][1] * 100) for f in desired}
+        return key, {'name': device['model'], 'output': device['name'],
+                     'values': actual, 'target': desired, 'mode': target['mode'],
+                     'settled': actual == desired}
+
+    def shadow_lift(self, main, settings=None):
+        """Apply or remove the Game shadow lift from current settings: (errors, readback)."""
+        if settings is None:
+            with self.lock:
+                settings = json.loads(json.dumps(self.settings))
+        errors, status = [], None
+        game = settings['monitors'].get(main, {}).get('mode') == 'game'
+        # Serialised: requests apply this directly while the tick thread may also be here.
+        with self.lock:
+            try:
+                if game and main in self.devices:
+                    output_id = self.devices[main].get('output_id')
+                    if not output_id:
+                        raise RuntimeError('Main monitor has no XRandR output identifier')
+                    status = self.gamma.apply(output_id, settings['shadows'])
+                else:
+                    self.gamma.restore()
+                    if game:
+                        errors.append('Main monitor is disconnected; Game remains pending')
+            except Exception as e:
+                errors.append(f'Shadow lift: {e}')
+                self.gamma.restore()
+        return errors, status
+
+    def tick(self):
+        config = load(CONFIG).get('ambient', {})
+        if not config.get('enabled'):
+            self.gamma.restore()
+            return
+        # Shadow lift first: a slider or mode change must not wait behind the light
+        # sensor/weather poll or the DDC round-trips below.
+        if self.devices:
+            self.shadow_lift(config.get('main_monitor'))
+        self.light.poll(config)
+        sample = self.light.choose(config)
+        outputs = read_outputs()
+        self.discover(outputs)
+        with self.lock:
+            main = config.get('main_monitor')
+            settings = json.loads(json.dumps(self.settings))
+            revision = self.revision
+            snap_keys = set(self.snap_keys)
+            exact = light_level(sample, settings['levels'])
+            # Whole percents, with a little stickiness so a reading hovering between two
+            # of them does not make the backlight flutter.
+            if self.level is None or abs(exact - self.level) >= .75:
+                self.level = round(exact)
+            level = self.level
+        wanted = targets(self.devices, main, level, settings['monitors'], settings.get('match'))
+        # User tuning within a mode persists until Auto is selected.
+        for key, entry in settings['monitors'].items():
+            if key in wanted:
+                wanted[key].update(entry.get('values', {}))
+        for key, target in wanted.items():
+            quirk = contrast_quirk(key)
+            if quirk:
+                if '12' not in settings['monitors'].get(key, {}).get('values', {}) and target['mode'] != 'movie':
+                    target['12'] = quirk.get('auto', target['12'])
+                target['12'] = min(target['12'], quirk.get('max', 100))
+        # Re-evaluated against the freshly discovered layout; a no-op when already applied.
+        errors, gamma_status = self.shadow_lift(main, settings)
+        if gamma_status and time.monotonic() - self.last_warmth >= 60:
+            self.last_warmth = time.monotonic()
+            try:
+                # Redshift is paused while the lift is on; keep the evening warmth moving.
+                with self.lock:
+                    others = [self.gamma.rr.crtc(d['output_id']) for k, d in self.devices.items()
+                              if k != main and d.get('output_id')] if self.gamma.rr else []
+                    self.gamma.follow_redshift([c for c in others if c])
+                errors, gamma_status = self.shadow_lift(main, settings)
+            except Exception as e:
+                errors.append(f'Redshift warmth: {e}')
+        ramp_step = time.monotonic() - self.last_ramp_step >= 14
+        if ramp_step:
+            self.last_ramp_step = time.monotonic()
+        actual = {}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(self.apply_monitor, item, wanted[item[0]], ramp_step,
+                                   item[0] in snap_keys, lambda: self.revision != revision)
+                       for item in self.devices.items()]
+            for future in futures:
+                try:
+                    key, result = future.result()
+                    actual[key] = result
+                except Exception as e:
+                    errors.append(str(e))
+        if not self.devices:
+            errors.append('No connected DDC monitors')
+        result = {'ready': bool(actual) and not errors, 'updated_at': time.time(),
+                  'level': level, 'level_exact': round(exact, 1),
+                  'levels': settings['levels'], 'light': sample,
+                  'monitors': actual, 'errors': errors, 'main_monitor': main,
+                  'shadows': settings['shadows'], 'shadow_readback': gamma_status,
+                  'match': settings.get('match', {}),
+                  'overrides': settings['monitors'], 'applied_revision': revision,
+                  'sensor_error': self.light.sensor_error, 'weather_error': self.light.weather_error}
+        with self.lock:
+            self.snap_keys.difference_update(k for k in snap_keys if k in actual and actual[k]['settled'])
+            result['requested_revision'] = self.revision
+            result['pending'] = self.revision != revision
+            self.status = result
+            save(STATUS, result)
+
+    def run(self):
+        try:
+            while not self.stop.is_set():
+                self.changed.clear()
+                try:
+                    self.tick()
+                except Exception as e:
+                    with self.lock:
+                        self.status.update({'ready': False, 'errors': [str(e)], 'updated_at': time.time()})
+                        save(STATUS, self.status)
+                    print(f'ambient: {e}', file=sys.stderr, flush=True)
+                self.changed.wait(15)
+        finally:
+            self.gamma.restore()
+
+
+def serve():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(RUNTIME / 'monitor-ambient.lock', 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        recover()
+        engine = Engine()
+
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self):
+                self.connection.settimeout(3)
+                try:
+                    data = self.rfile.readline(65537)
+                    if len(data) > 65536:
+                        raise ValueError('Request too large')
+                    result = engine.handle(json.loads(data))
+                    immediate = result.pop('_apply', None) if isinstance(result, dict) else None
+                except Exception as e:
+                    result, immediate = {'error': str(e)}, None
+                self.wfile.write(json.dumps(result).encode() + b'\n')
+                self.wfile.flush()
+                if immediate:
+                    engine.apply_now(immediate)
+
+        SOCKET.unlink(missing_ok=True)
+        with socketserver.ThreadingUnixStreamServer(str(SOCKET), Handler) as server:
+            os.chmod(SOCKET, 0o600)
+            server.daemon_threads = True
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            def stop(*_):
+                engine.stop.set()
+                engine.changed.set()
+            signal.signal(signal.SIGTERM, stop)
+            signal.signal(signal.SIGINT, stop)
+            try:
+                engine.run()
+            finally:
+                server.shutdown()
+                SOCKET.unlink(missing_ok=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=['serve', 'recover', 'status', 'auto', 'movie', 'game',
+                                            'release', 'request'])
+    parser.add_argument('payload', nargs='?')
+    args = parser.parse_args()
+    if args.command == 'serve':
+        serve()
+    elif args.command == 'recover':
+        recover()
+    else:
+        payload = json.loads(args.payload) if args.command == 'request' else (
+            {'op': 'status'} if args.command == 'status' else
+            {'op': 'release', 'key': 'all'} if args.command == 'release' else
+            {'op': 'mode', 'mode': args.command})
+        try:
+            print(json.dumps(request(payload)))
+        except (OSError, RuntimeError, ValueError) as e:
+            print(json.dumps({'error': str(e)}))
+            return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

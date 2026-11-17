@@ -1,0 +1,17 @@
+[Unit]
+Description=Ambient monitor brightness and main-monitor Movie/Game presets
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=%h/.Xauthority
+ExecStart=%h/.local/bin/monitor-automation serve
+ExecStopPost=%h/.local/bin/monitor-automation recover
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

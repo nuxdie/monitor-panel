@@ -1,50 +1,114 @@
 #!/usr/bin/python3
-"""Monitor panel for the xfce4 panel button: every DDC/CI monitor on the desk with brightness up
-front and contrast, colour preset, input, speaker volume, RGB gains and power behind a
-disclosure, plus named profiles (Day / Evening / Night …) that set all monitors in one click.
+"""Monitor panel for the xfce4 panel button.
 
-Talks to the monitors with ddcutil (needs ddcutil and the i2c group; it says what is missing
-otherwise). Monitors are matched to xrandr outputs through their EDID, so each row shows where
-the screen sits on the desk. The bus↔monitor mapping and the monitors' capabilities are cached
-in ~/.cache/monitor-panel so the panel opens instantly; profiles, monitor names and which rows
-are expanded live in ~/.config/monitor-panel/config.json.
+Top to bottom, in the order things are needed: the mode (Auto / Movie / Game); one sentence
+for what the screens are doing now; today's brightness curve with the four numbers that
+shape it, each changed by dragging it; the one control that belongs to the current mode
+(Game: Shadows, drawn as the tone curve it applies); then the desk itself, every screen
+where it stands and each one its own brightness control (drag it up or down), an All
+track, and the clicked screen's contrast, speaker and power.
+
+Brightness is continuous: it glides between the four levels as the light changes. The
+dashed line across a screen is where automatic brightness wants it; a screen set by hand
+is pinned and says so.
+
+Monitors from different makers do not look alike at the same number. Set them by eye until
+they do and press "These look equally bright → remember": from then on automatic brightness
+and the All track keep them looking alike.
+
+Brightness and contrast go through the brightness service (monitor-automation) when it
+runs, so there is exactly one writer per monitor; without it the panel talks to the
+monitors itself with ddcutil (needs ddcutil and the i2c group; it says what is missing
+otherwise). Monitors are matched to xrandr outputs through their EDID. The bus↔monitor
+mapping and capabilities are cached in ~/.cache/monitor-panel so the panel opens instantly;
+presets and monitor names live in ~/.config/monitor-panel/config.json.
 Clicking the panel button again, Escape, or clicking elsewhere closes it.
 """
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
+import sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from monitor_hardware import parse_vcp, parse_caps, parse_detect, read_outputs
+from ambient import (STATUS, RUNTIME, LEVELS, PHASES, DEFAULT_LAT, DEFAULT_LON, matched,
+                     clear_day_level, solar_elevation,
+                     request as service_request)
+from gamma_control import curve as shadow_curve
 
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, Gio, GLib, Gtk, Pango
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango, PangoCairo
 
 APP_ID = "desk.mochi.MonitorPanel"
 CONFIG = os.path.expanduser("~/.config/monitor-panel/config.json")
 CACHE = os.path.expanduser("~/.cache/monitor-panel")
 SETUP_HINT = "sudo apt install ddcutil\nsudo usermod -aG i2c $USER\nthen log out and back in"
 
-# VCP feature codes (MCCS)
-BRIGHTNESS, CONTRAST, PRESET = "10", "12", "14"
-GAIN_R, GAIN_G, GAIN_B = "16", "18", "1A"
-INPUT, VOLUME, MUTE, POWER = "60", "62", "8D", "D6"
-GAINS = [GAIN_R, GAIN_G, GAIN_B]
-READ_SET = [BRIGHTNESS, CONTRAST, PRESET, *GAINS, INPUT, VOLUME, MUTE, POWER]
-PROFILE_SET = [BRIGHTNESS, CONTRAST, PRESET, *GAINS, VOLUME]   # input and power never go in a profile
-USER_PRESET = 0x0B
-DEFAULT_PROFILES = [{"name": "Day", "any": {BRIGHTNESS: 70}},
-                    {"name": "Evening", "any": {BRIGHTNESS: 35}},
-                    {"name": "Night", "any": {BRIGHTNESS: 10}}]
+# VCP feature codes (MCCS). Colour presets, inputs and RGB gains are deliberately not here.
+BRIGHTNESS, CONTRAST = "10", "12"
+VOLUME, MUTE, POWER = "62", "8D", "D6"
+READ_SET = [BRIGHTNESS, CONTRAST, VOLUME, MUTE]
+PROFILE_SET = [BRIGHTNESS, CONTRAST, VOLUME]   # what a saved preset restores
+MODES = [("auto", "Auto", "Every screen follows the room light"),
+         ("movie", "Movie", "Main screen at 50% brightness and contrast; the others stay automatic"),
+         ("game", "Game", "Main screen lifts dark areas so you can see into shadows; the others stay automatic")]
 
+# Quiet by design: no boxes, no button chrome, one accent colour, hairlines between rows.
+# Ink goes to the levels; everything else recedes.
 CSS = b"""
-.mp-card { border-radius: 8px; padding: 6px 10px 8px 10px; background: alpha(currentColor, 0.05); }
-.mp-name { font-weight: bold; padding: 2px 6px; }
-.mp-dim { opacity: 0.55; }
-.mp-chip { padding: 2px 10px; }
-.mp-small { padding: 1px 6px; }
+.mp-surface { background-color: @theme_base_color; border: 1px solid @borders; padding: 14px 16px 10px 16px; }
+.mp-surface label, .mp-surface button { font-feature-settings: "tnum"; }
+.mp-dim { opacity: 0.5; font-size: 0.9em; }
+.mp-name { font-weight: 600; }
+.mp-status { font-size: 1.15em; padding: 6px 0 0 0; }
+.mp-warn { color: @warning_color; padding: 2px 0 0 0; }
+.mp-detail { margin-top: 8px; padding: 4px 0 2px 0; border-top: 1px solid alpha(@theme_fg_color, 0.09); }
+.mp-scrub { font-weight: 600; color: @theme_selected_bg_color;
+            border-bottom: 1px dotted @theme_selected_bg_color; padding: 0 1px; }
+.mp-ok { padding: 3px 10px; color: @theme_selected_bg_color; font-weight: 600; }
+.mp-foot { margin-top: 6px; padding: 4px 0 0 0; border-top: 1px solid alpha(@theme_fg_color, 0.09); }
+
+.mp-surface button { background-image: none; background-color: transparent; border: none;
+                    box-shadow: none; text-shadow: none; -gtk-icon-shadow: none;
+                    min-height: 0; min-width: 0; outline-offset: -1px; }
+.mp-tab { padding: 2px 0 3px 0; border-radius: 0; font-size: 1.15em; font-weight: 600;
+          color: alpha(@theme_fg_color, 0.45); border-bottom: 2px solid transparent; }
+.mp-tab:hover { color: @theme_fg_color; }
+.mp-tab.mp-on { color: @theme_fg_color; border-bottom: 2px solid @theme_selected_bg_color; }
+.mp-tab:disabled { color: alpha(@theme_fg_color, 0.25); }
+.mp-preset { font-size: 1em; font-weight: normal; }
+.mp-namebtn { padding: 1px 0; font-weight: 600; }
+.mp-link { padding: 1px 0; font-size: 0.9em; color: @theme_selected_bg_color; }
+.mp-link:hover { color: shade(@theme_selected_bg_color, 0.8); }
+.mp-arrow { padding: 2px 3px; color: alpha(@theme_fg_color, 0.5); }
+.mp-arrow:hover, .mp-arrow:checked { color: @theme_fg_color; }
+
+.mp-scale { padding: 0; margin: 0; min-height: 0; }
+.mp-scale contents { margin: 0; }
+.mp-scale trough { min-height: 2px; margin: 5px 0; border: none; border-radius: 1px; box-shadow: none;
+                   background-image: none; background-color: alpha(@theme_fg_color, 0.14); }
+.mp-scale trough highlight { min-height: 2px; margin: 0; border: none; border-radius: 1px;
+                             background-image: none; background-color: alpha(@theme_fg_color, 0.6); }
+.mp-scale slider { min-width: 11px; min-height: 11px; margin: -5px; border-radius: 50%;
+                   border: 1.5px solid @theme_base_color; box-shadow: none;
+                   background-image: none; background-color: @theme_fg_color; }
+.mp-scale slider:hover, .mp-scale slider:active { background-color: @theme_selected_bg_color; }
+.mp-scale:disabled slider { background-color: alpha(@theme_fg_color, 0.3); }
+.mp-scale:disabled trough highlight { background-color: alpha(@theme_fg_color, 0.2); }
+.mp-scale marks { margin: 0; }
+.mp-scale marks.bottom { margin-top: 0; min-height: 4px; }
+.mp-scale marks.top { margin-bottom: 0; min-height: 6px; }
+.mp-scale mark { margin: 0; }
+.mp-scale mark indicator { min-height: 3px; min-width: 1px; color: alpha(@theme_fg_color, 0.4); }
+.mp-scale marks.top mark indicator { min-height: 6px; min-width: 2px; color: @theme_selected_bg_color; }
+.mp-scale value { min-width: 2.4em; margin-left: 6px; font-weight: 600; color: @theme_fg_color; opacity: 1; }
 """
 
 
@@ -79,126 +143,18 @@ def run_async(argv, done):
     p.communicate_utf8_async(None, None, finished)
 
 
-def hexval(tok):
-    return int(tok.lstrip("x"), 16)
 
 
-def parse_vcp(out):
-    """ddcutil getvcp --brief → ({feature: value}, {feature: max}); unsupported features are absent."""
-    vals, maxes = {}, {}
-    for line in out.splitlines():
-        p = line.split()
-        if len(p) < 4 or p[0] != "VCP":
-            continue
-        f, kind = p[1].upper(), p[2]
-        if kind == "C" and len(p) >= 5:
-            vals[f], maxes[f] = int(p[3]), int(p[4])
-        elif kind == "SNC":
-            vals[f] = hexval(p[3])
-        elif kind == "CNC" and len(p) >= 7:
-            maxes[f] = (hexval(p[3]) << 8) | hexval(p[4])
-            vals[f] = (hexval(p[5]) << 8) | hexval(p[6])
-    return vals, maxes
 
 
-def parse_caps(text):
-    """ddcutil capabilities → {feature: [(code, label), …]} ([] for continuous features)."""
-    caps, cur = {}, None
-    for line in text.splitlines():
-        m = re.match(r"\s+Feature: ([0-9A-Fa-f]{2}) \(", line)
-        if m:
-            cur = m.group(1).upper()
-            caps[cur] = []
-            continue
-        if cur is None:
-            continue
-        m = re.match(r"\s+Values: ((?:[0-9a-fA-F]{2}\s+)+)\(interpretation unavailable\)", line)
-        if m:
-            caps[cur] += [(int(h, 16), f"Mode {h}") for h in m.group(1).split()]
-            continue
-        m = re.match(r"\s+([0-9a-fA-F]{2}): (.+)", line)
-        if m:
-            label = m.group(2).strip()
-            if label == "Unrecognized value":
-                label = f"Mode {m.group(1)}"
-            caps[cur].append((int(m.group(1), 16), label))
-    return caps
 
 
-def parse_detect(out):
-    """ddcutil detect → {edid key: {"bus", "model", "connector"}}."""
-    found = {}
-    for block in re.split(r"\n(?=\S)", out):
-        if not block.startswith("Display"):
-            continue           # "Invalid display" = an output without DDC
-        def field(rx):
-            m = re.search(rx, block)
-            return m.group(1).strip() if m else None
-        bus, mfg = field(r"/dev/i2c-(\d+)"), field(r"Mfg id:\s+(\w{3})")
-        if not (bus and mfg):
-            continue
-        product = int(field(r"Product code:\s+(\d+)") or 0)
-        serial = int(field(r"Binary serial number:\s+(\d+)") or 0)
-        found[edid_key(mfg, product, serial)] = {
-            "bus": int(bus), "model": field(r"Model:\s+(.*)") or "",
-            "connector": field(r"DRM connector:\s+(\S+)") or ""}
-    return found
 
 
-def edid_key(mfg, product, serial):
-    return f"{mfg}-{product:04x}-{serial:08x}"
 
 
-def decode_edid(hexstr):
-    """(key, monitor name) from a raw EDID hex dump, or (None, "")."""
-    try:
-        e = bytes.fromhex(hexstr[:256])
-    except ValueError:
-        return None, ""
-    if len(e) < 128:
-        return None, ""
-    v = (e[8] << 8) | e[9]
-    mfg = "".join(chr(((v >> s) & 31) + 64) for s in (10, 5, 0))
-    product = e[10] | (e[11] << 8)
-    serial = e[12] | (e[13] << 8) | (e[14] << 16) | (e[15] << 24)
-    name = ""
-    for i in (54, 72, 90, 108):
-        d = e[i:i + 18]
-        if d[:3] == b"\0\0\0" and d[3] == 0xFC:
-            name = d[5:18].decode("ascii", "ignore").strip(" \n\0")
-    return edid_key(mfg, product, serial), name
 
 
-def read_outputs():
-    """Active xrandr outputs: [{name, w, h, x, y, key, model}] (key None without an EDID)."""
-    try:
-        out = subprocess.run(["xrandr", "--props"], capture_output=True, text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    outputs, cur, in_edid, edid = [], None, False, ""
-    for line in out.splitlines() + ["END"]:
-        if not line.startswith(("\t", " ")):
-            if cur and edid:
-                cur["key"], cur["model"] = decode_edid(edid)
-            cur, in_edid, edid = None, False, ""
-            m = re.match(r"^(\S+) connected(?: primary)? (\d+)x(\d+)\+(\d+)\+(\d+)", line)
-            if m:
-                cur = {"name": m.group(1), "w": int(m.group(2)), "h": int(m.group(3)),
-                       "x": int(m.group(4)), "y": int(m.group(5)), "key": None, "model": ""}
-                outputs.append(cur)
-            continue
-        if cur is None:
-            continue
-        if re.match(r"^\s+EDID:", line):
-            in_edid = True
-            continue
-        if in_edid:
-            m = re.match(r"^\s+([0-9a-fA-F]{32})\s*$", line)
-            if m:
-                edid += m.group(1)
-            else:
-                in_edid = False
-    return outputs
 
 
 def load_json(path, default):
@@ -261,7 +217,8 @@ class Bus:
             self.busy = False
             done(out)
             self._pump()
-        run_async(["ddcutil", "--bus", str(self.n), *args], finished)
+        run_async(["flock", "--timeout", "10", str(RUNTIME / f"monitor-ddc-{self.n}.lock"),
+                   "ddcutil", "--bus", str(self.n), *args], finished)
 
 
 class Monitor:
@@ -304,12 +261,98 @@ def icon(name, size=Gtk.IconSize.BUTTON):
     return Gtk.Image.new_from_icon_name(name, size)
 
 
-def make_scale(maxv=100):
-    s = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, maxv, 1)
-    s.set_value_pos(Gtk.PositionType.RIGHT)
-    s.set_digits(0)
-    s.set_hexpand(True)
-    return s
+def stops(maxv=100, start=1):
+    """0 and the preferred numbers (Renard R10, ISO 3) from start up to maxv, as integers:
+    0 1 2 3 4 5 6 8 10 13 16 20 25 32 40 50 63 80 100. Each stop is about a quarter more
+    than the one before. The eye and the ear judge by ratio, not by difference, so these
+    are equal-looking steps: 5→6 is as visible as 50→63, while 50→51 is nothing."""
+    out, decade = {0, maxv}, 1
+    while decade <= maxv:
+        for m in (1, 1.25, 1.6, 2, 2.5, 3.15, 4, 5, 6.3, 8):
+            v = int(m * decade + .5)
+            if start <= v <= maxv / 1.12:          # no stop crowding the top one
+                out.add(v)
+        decade *= 10
+    return sorted(out)
+
+
+def pos_of(level, series):
+    """Where a level sits on a series of stops, as a fractional index."""
+    level = max(0, min(level, series[-1]))
+    hi = next(i for i, v in enumerate(series) if v >= level)
+    if series[hi] == level:
+        return hi
+    return hi - 1 + (level - series[hi - 1]) / (series[hi] - series[hi - 1])
+
+
+def level_at(pos, series):
+    lo = max(0, min(int(pos), len(series) - 1))
+    hi = min(lo + 1, len(series) - 1)
+    return round(series[lo] + (series[hi] - series[lo]) * (pos - lo))
+
+
+def notch(pos, direction, series):
+    """The next notch from a (possibly in-between) position, direction ±1."""
+    target = math.floor(pos + 1e-6) + 1 if direction > 0 else math.ceil(pos - 1e-6) - 1
+    return max(0, min(target, len(series) - 1))
+
+
+class StopScale(Gtk.Scale):
+    """A slider whose notches are the stops, evenly spaced: the same travel is the same visible
+    change anywhere on the slider, and the low end, where a few percent matter, gets the
+    room. Dragging, arrow keys and the scroll wheel always land on a notch. A level that
+    came from elsewhere is shown where it really is, between notches. set_target() draws
+    one tick above the track: where automatic brightness wants this slider."""
+
+    def __init__(self, maxv=100, start=1, fmt=str):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
+        self.start, self.fmt, self.stops, self.target = start, fmt, [], None
+        self.set_value_pos(Gtk.PositionType.RIGHT)
+        self.set_hexpand(True)
+        self.get_style_context().add_class("mp-scale")
+        self.set_max(maxv)
+        self.connect("format-value", lambda _s, pos: self.fmt(level_at(pos, self.stops)))
+        self.connect("change-value", self.on_change)
+
+    def set_max(self, maxv):
+        maxv = max(int(maxv), 1)
+        if self.stops and self.stops[-1] == maxv:
+            return
+        level = self.get_level() if self.stops else 0
+        self.stops = stops(maxv, self.start)
+        self.set_range(0, len(self.stops) - 1)
+        self.set_increments(1, 2)
+        self.draw_marks()
+        self.set_level(level)
+
+    def set_target(self, level):
+        if level != self.target:
+            self.target = level
+            self.draw_marks()
+
+    def draw_marks(self):
+        self.clear_marks()
+        for i in range(len(self.stops)):
+            self.add_mark(i, Gtk.PositionType.BOTTOM, None)
+        if self.target is not None:
+            self.add_mark(pos_of(self.target, self.stops), Gtk.PositionType.TOP, None)
+
+    def get_level(self):
+        return level_at(self.get_value(), self.stops)
+
+    def set_level(self, level):
+        self.set_value(pos_of(level, self.stops))
+
+    def on_change(self, _scale, scroll, pos):
+        now = self.get_value()
+        if scroll == Gtk.ScrollType.JUMP:                 # dragging or clicking the trough
+            target = max(0, min(round(pos), len(self.stops) - 1))
+        elif pos != now:                                  # keys / wheel: the next notch
+            target = notch(now, 1 if pos > now else -1, self.stops)
+        else:
+            return True
+        self.set_value(target)
+        return True
 
 
 def dim_label(text, xalign=0):
@@ -318,43 +361,42 @@ def dim_label(text, xalign=0):
     return lbl
 
 
-class Chooser(Gtk.MenuButton):
-    """A drop-down that stays inside the window (a GtkMenu would steal focus and close the panel)."""
+def link_button(text, tip, cb):
+    """A quiet text action: reads as part of the sentence it sits in."""
+    b = Gtk.Button(label=text)
+    b.set_relief(Gtk.ReliefStyle.NONE)
+    b.get_style_context().add_class("mp-link")
+    b.set_tooltip_text(tip)
+    b.connect("clicked", cb)
+    return b
 
-    def __init__(self, options, on_pick, fallback="Custom"):
-        super().__init__()
-        self.options, self.on_pick, self.code, self.fallback = options, on_pick, None, fallback
-        self.lbl = Gtk.Label(label="—", xalign=0)
-        self.lbl.set_ellipsize(Pango.EllipsizeMode.END)
-        box = Gtk.Box(spacing=6)
-        box.pack_start(self.lbl, True, True, 0)
-        box.pack_start(icon("pan-down-symbolic"), False, False, 0)
-        self.add(box)
-        vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        vb.set_border_width(4)
-        self.buttons = {}
-        for code, label in options:
-            b = Gtk.ModelButton(text=label)
-            b.props.role = Gtk.ButtonRole.RADIO
-            b.connect("clicked", self._picked, code)
-            vb.pack_start(b, False, False, 0)
-            self.buttons[code] = b
-        vb.show_all()
-        pop = Gtk.Popover()
-        pop.add(vb)
-        self.set_popover(pop)
 
-    def _picked(self, _b, code):
-        self.get_popover().popdown()
-        if code != self.code:
-            self.set_code(code)
-            self.on_pick(code)
+def theme_colours(widget):
+    ctx = widget.get_style_context()
+    return ctx.lookup_color("theme_fg_color")[1], ctx.lookup_color("theme_selected_bg_color")[1]
 
-    def set_code(self, code):
-        self.code = code
-        self.lbl.set_text(dict(self.options).get(code, self.fallback))
-        for c, b in self.buttons.items():
-            b.props.active = (c == code)
+
+def set_cursor(widget, name):
+    def realized(w):
+        w.get_window().set_cursor(Gdk.Cursor.new_from_name(w.get_display(), name))
+    widget.connect("realize", realized)
+
+
+def draw_text(cr, widget, text, x, y, scale=1.0, bold=False, rgba=None, alpha=1.0, align=0.0):
+    """Text in the panel's own font. (x, y) is the top edge; align 0 left, .5 centre, 1 right.
+    Returns (width, height)."""
+    layout = widget.create_pango_layout(text)
+    desc = widget.get_pango_context().get_font_description().copy()
+    desc.set_size(int(desc.get_size() * scale))
+    if bold:
+        desc.set_weight(Pango.Weight.SEMIBOLD)
+    layout.set_font_description(desc)
+    w, h = layout.get_pixel_size()
+    fg = rgba or theme_colours(widget)[0]
+    cr.set_source_rgba(fg.red, fg.green, fg.blue, alpha)
+    cr.move_to(x - w * align, y)
+    PangoCairo.show_layout(cr, layout)
+    return w, h
 
 
 class EntryPopover(Gtk.Popover):
@@ -369,7 +411,7 @@ class EntryPopover(Gtk.Popover):
         self.entry = Gtk.Entry(text=text)
         self.entry.set_width_chars(16)
         ok = Gtk.Button(label=button)
-        ok.get_style_context().add_class("suggested-action")
+        ok.get_style_context().add_class("mp-ok")
         row.pack_start(self.entry, True, True, 0)
         row.pack_start(ok, False, False, 0)
         vb.pack_start(row, False, False, 0)
@@ -391,263 +433,363 @@ class EntryPopover(Gtk.Popover):
         self.entry.grab_focus()
 
 
-class MiniMap(Gtk.DrawingArea):
-    """The desk's monitor layout, this monitor filled in."""
+class Scrub(Gtk.EventBox):
+    """A number you change by dragging it sideways (or scrolling over it): no dialog, no
+    field, the consequence shows while you move."""
 
-    def __init__(self, panel, mon):
+    def __init__(self, value, on_change, lo=0, hi=100, tip=""):
         super().__init__()
-        self.panel, self.mon = panel, mon
-        self.set_size_request(44, 24)
+        self.value, self.on_change, self.lo, self.hi = value, on_change, lo, hi
+        self.start = None
+        self.label = Gtk.Label(label=str(value))
+        self.label.get_style_context().add_class("mp-scrub")
+        self.add(self.label)
+        self.set_tooltip_text(tip + "\nDrag sideways or scroll to change.")
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
+                        Gdk.EventMask.BUTTON1_MOTION_MASK | Gdk.EventMask.SCROLL_MASK |
+                        Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        self.connect("button-press-event", self.pressed)
+        self.connect("motion-notify-event", self.moved)
+        self.connect("button-release-event", lambda *_: setattr(self, "start", None))
+        self.connect("scroll-event", self.scrolled)
+        set_cursor(self, "ew-resize")
+
+    def show_value(self, value):
+        self.value = value
+        self.label.set_text(str(value))
+
+    def change(self, value):
+        value = max(self.lo, min(self.hi, int(value)))
+        if value != self.value:
+            self.show_value(value)
+            self.on_change(value)
+
+    def pressed(self, _w, event):
+        self.start = (event.x_root, self.value)
+        return True
+
+    def moved(self, _w, event):
+        if self.start:
+            self.change(self.start[1] + round((event.x_root - self.start[0]) / 6))
+        return True
+
+    def scrolled(self, _w, event):
+        step = scroll_step(event)
+        if step:
+            self.change(self.value + step)
+        return True
+
+
+def scroll_step(event):
+    """+1 for scrolling up/away, −1 for down, 0 for nothing worth a step."""
+    if event.direction == Gdk.ScrollDirection.UP:
+        return 1
+    if event.direction == Gdk.ScrollDirection.DOWN:
+        return -1
+    if event.direction == Gdk.ScrollDirection.SMOOTH:
+        _ok, _dx, dy = event.get_scroll_deltas()
+        return -1 if dy > .5 else 1 if dy < -.5 else 0
+    return 0
+
+
+class DayCurve(Gtk.DrawingArea):
+    """Today's automatic brightness, midnight to midnight. The line is what a clear day
+    gives from the sun's height alone, built from the four levels under it; the dot is the
+    level the light asks for right now, so a dot under the line is an overcast day. The
+    line is smooth because the brightness is: it glides between the four levels instead of
+    stepping from one to the next. No frame, grid or legend; hours are on the drawing."""
+
+    H = 58
+
+    def __init__(self, panel):
+        super().__init__()
+        self.panel = panel
+        self.set_size_request(-1, self.H)
+        self.connect("draw", self.on_draw)
+        self.set_tooltip_text("Automatic brightness through today.\n"
+                              "Line: a clear day, from the sun's height. Dot: what the light asks for now.\n"
+                              "Change the four numbers below to reshape it.")
+
+    def on_draw(self, w, cr):
+        amb = self.panel.config.get("ambient", {})
+        lat, lon = amb.get("latitude", DEFAULT_LAT), amb.get("longitude", DEFAULT_LON)
+        levels = self.panel.levels()
+        fg, sel = theme_colours(w)
+        W, H = w.get_allocated_width(), w.get_allocated_height()
+        left, right, top, base = 1, W - 1, 6, H - 15
+        t = time.localtime()
+        midnight = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1))
+        peak = max(max(levels.values()) * 1.15, 12)
+        x = lambda hours: left + (right - left) * hours / 24
+        y = lambda level: base - (base - top) * level / peak
+        curve = [clear_day_level(solar_elevation(midnight + m * 300, lat, lon), levels) for m in range(289)]
+
+        cr.set_line_width(1)
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, .12)       # the floor: screen off
+        cr.move_to(left, base + .5)
+        cr.line_to(right, base + .5)
+        cr.stroke()
+        for h in (0, 6, 12, 18, 24):
+            draw_text(cr, w, f"{h:02d}", x(h), base + 2, .75, alpha=.4, align=0 if h == 0 else 1 if h == 24 else .5)
+        # under the curve: a faint wash, so the day reads as a shape
+        cr.move_to(x(0), base)
+        for m, level in enumerate(curve):
+            cr.line_to(x(m / 12), y(level))
+        cr.line_to(x(24), base)
+        cr.close_path()
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, .05)
+        cr.fill()
+        cr.set_line_width(1.3)
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, .6)
+        for m, level in enumerate(curve):
+            (cr.line_to if m else cr.move_to)(x(m / 12), y(level))
+        cr.stroke()
+        # now
+        now_h = (time.time() - midnight) / 3600
+        level = self.panel.auto_level()
+        if level is None:
+            level = curve[min(288, int(now_h * 12))]
+        cr.set_line_width(1)
+        cr.set_source_rgba(sel.red, sel.green, sel.blue, .4)
+        cr.move_to(x(now_h) + .5, top - 4)
+        cr.line_to(x(now_h) + .5, base)
+        cr.stroke()
+        cr.set_source_rgba(sel.red, sel.green, sel.blue, 1)
+        cr.arc(x(now_h) + .5, y(level), 3.4, 0, 2 * math.pi)
+        cr.fill()
+
+
+class ToneCurve(Gtk.DrawingArea):
+    """What Shadows does to the picture: input brightness across, output up. The straight
+    diagonal is an untouched picture; the curve bulges only at the dark end."""
+
+    def __init__(self):
+        super().__init__()
+        self.level = 0
+        self.set_size_request(44, 34)
         self.set_valign(Gtk.Align.CENTER)
         self.connect("draw", self.on_draw)
 
+    def set_level(self, level):
+        self.level = level
+        self.queue_draw()
+
     def on_draw(self, w, cr):
-        mons = [m for m in self.panel.monitors if m.placed]
-        if not mons:
-            return
-        ctx = w.get_style_context()
-        fg = ctx.lookup_color("theme_fg_color")[1]
-        sel = ctx.lookup_color("theme_selected_bg_color")[1]
-        W, H = w.get_allocated_width(), w.get_allocated_height()
-        x0, y0 = min(m.x for m in mons), min(m.y for m in mons)
-        bw = max(m.x + m.w for m in mons) - x0
-        bh = max(m.y + m.h for m in mons) - y0
-        k = min((W - 2) / bw, (H - 2) / bh)
-        ox, oy = (W - bw * k) / 2, (H - bh * k) / 2
-        for m in mons:
-            cr.rectangle(ox + (m.x - x0) * k + 0.5, oy + (m.y - y0) * k + 0.5,
-                         max(m.w * k - 1, 1), max(m.h * k - 1, 1))
-            if m is self.mon:
-                cr.set_source_rgba(sel.red, sel.green, sel.blue, 1)
-                cr.fill()
-            else:
-                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.22)
-                cr.fill()
+        fg, sel = theme_colours(w)
+        W, H = w.get_allocated_width() - 2, w.get_allocated_height() - 2
+        cr.set_line_width(1)
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, .25)
+        cr.move_to(1, H + 1)
+        cr.line_to(W + 1, 1)
+        cr.stroke()
+        cr.set_source_rgba(sel.red, sel.green, sel.blue, 1)
+        cr.set_line_width(1.5)
+        cr.move_to(1, H + 1)
+        for i in range(1, 45):
+            cr.line_to(1 + W * i / 44, 1 + H * (1 - min(shadow_curve(i / 44, self.level), 1)))
+        cr.stroke()
 
 
-class MonitorRow(Gtk.Box):
-    """One monitor: name + minimap + brightness, and the rest under a disclosure."""
+class Screen:
+    """One monitor as the panel knows it: identity, current values, what it can do."""
 
     def __init__(self, panel, mon):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         self.panel, self.mon = panel, mon
         self.values, self.maxes, self.caps = {}, {}, None
-        self.controls = {}          # feature → Scale / Chooser / ToggleButton
-        self.guard = False
-        self.get_style_context().add_class("mp-card")
+        self.is_main = mon.key == panel.config.get("ambient", {}).get("main_monitor")
+        self.pinned = False
+        self.target = None          # where automatic brightness wants it
 
-        head = Gtk.Box(spacing=6)
-        head.pack_start(MiniMap(panel, mon), False, False, 0)
-        self.name_btn = Gtk.Button()
-        self.name_btn.set_relief(Gtk.ReliefStyle.NONE)
-        self.name_lbl = Gtk.Label(xalign=0)
-        self.name_lbl.set_ellipsize(Pango.EllipsizeMode.END)
-        self.name_lbl.get_style_context().add_class("mp-name")
-        self.name_btn.add(self.name_lbl)
-        self.name_btn.set_tooltip_text("Rename this monitor")
-        self.name_btn.connect("clicked", self.rename)
-        head.pack_start(self.name_btn, False, False, 0)
-        where = " · ".join(x for x in (position_word(mon, panel.monitors), mon.output) if x)
-        head.pack_start(dim_label(where), True, True, 0)
-        self.expander = Gtk.ToggleButton()
-        self.expander.set_relief(Gtk.ReliefStyle.NONE)
-        self.expander.add(icon("pan-end-symbolic"))
-        self.expander.set_tooltip_text("More settings")
-        self.expander.connect("toggled", self.toggled)
-        head.pack_end(self.expander, False, False, 0)
-        self.pack_start(head, False, False, 0)
-        self.refresh_name()
-
-        row = Gtk.Box(spacing=8)
-        row.pack_start(icon("display-brightness-symbolic"), False, False, 4)
-        self.brightness = self.add_scale(BRIGHTNESS)
-        row.pack_start(self.brightness, True, True, 0)
-        self.pack_start(row, False, False, 0)
-
-        self.revealer = Gtk.Revealer()
-        self.revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
-        self.pack_start(self.revealer, False, False, 0)
-        if mon.key in panel.config.get("expanded", []):
-            self.expander.set_active(True)
-
-    # --- building
-    def add_scale(self, feature, maxv=100):
-        s = make_scale(maxv)
-        s.set_sensitive(False)
-        s.connect("value-changed", self.on_scale, feature)
-        self.controls[feature] = s
-        return s
-
-    def build_details(self, caps):
-        self.caps = caps
-        grid = Gtk.Grid(column_spacing=10, row_spacing=4)
-        grid.set_margin_top(4)
-        r = 0
-
-        def label(text):
-            grid.attach(dim_label(text, xalign=1), 0, r, 1, 1)
-
-        if CONTRAST in caps:
-            label("Contrast")
-            grid.attach(self.add_scale(CONTRAST), 1, r, 1, 1)
-            r += 1
-        choosers = Gtk.Box(spacing=8, homogeneous=True)
-        if caps.get(PRESET):
-            ch = Chooser(caps[PRESET], lambda code: self.on_pick(PRESET, code))
-            ch.set_tooltip_text("Colour preset")
-            self.controls[PRESET] = ch
-            choosers.pack_start(ch, True, True, 0)
-        if caps.get(INPUT):
-            ch = Chooser(caps[INPUT], lambda code: self.on_pick(INPUT, code), fallback="Unknown")
-            ch.set_tooltip_text("Input source")
-            self.controls[INPUT] = ch
-            choosers.pack_start(ch, True, True, 0)
-        if choosers.get_children():
-            label("Colour · Input" if len(choosers.get_children()) == 2 else
-                  "Colour" if PRESET in self.controls else "Input")
-            grid.attach(choosers, 1, r, 1, 1)
-            r += 1
-        if VOLUME in caps:
-            label("Volume")
-            vol = Gtk.Box(spacing=4)
-            vol.pack_start(self.add_scale(VOLUME), True, True, 0)
-            if MUTE in caps:
-                mute = Gtk.ToggleButton()
-                mute.set_relief(Gtk.ReliefStyle.NONE)
-                mute.add(icon("audio-volume-muted-symbolic"))
-                mute.set_tooltip_text("Mute")
-                mute.connect("toggled", self.on_mute)
-                vol.pack_start(mute, False, False, 0)
-                self.controls[MUTE] = mute
-            grid.attach(vol, 1, r, 1, 1)
-            r += 1
-        if all(g in caps for g in GAINS):
-            label("RGB gains")
-            gains = Gtk.Box(spacing=4)
-            for g in GAINS:
-                gains.pack_start(self.add_scale(g), True, True, 0)
-                self.controls[g].set_value_pos(Gtk.PositionType.BOTTOM)
-            grid.attach(gains, 1, r, 1, 1)
-            r += 1
-        if POWER in caps:
-            label("Power")
-            off = Gtk.Button(label="Turn off screen")
-            off.get_style_context().add_class("mp-small")
-            off.set_halign(Gtk.Align.START)
-            off.set_tooltip_text("Switches this monitor off (DDC power mode). Wake it with its own power button.")
-            off.connect("clicked", lambda *_: self.mon.bus.write(POWER, 4))
-            grid.attach(off, 1, r, 1, 1)
-            r += 1
-        grid.show_all()
-        old = self.revealer.get_child()
-        if old:
-            self.revealer.remove(old)
-        self.revealer.add(grid)
-        self.apply_values()
-
-    # --- values
-    def set_values(self, vals, maxes):
-        self.values.update(vals)
-        self.maxes.update(maxes)
-        self.apply_values()
-        self.panel.values_changed()
-
-    def apply_values(self):
-        """Push known values into the controls without writing anything."""
-        self.guard = True
-        try:
-            for f, w in self.controls.items():
-                known = f in self.values
-                w.set_sensitive(known)
-                if not known:
-                    continue
-                v = self.values[f]
-                if isinstance(w, Gtk.Scale):
-                    if self.maxes.get(f, 100) != int(w.get_adjustment().get_upper()):
-                        w.set_range(0, self.maxes.get(f, 100))
-                    w.set_value(v)
-                elif isinstance(w, Chooser):
-                    w.set_code(v)
-                elif f == MUTE:
-                    w.set_active(v == 1)
-        finally:
-            self.guard = False
-
-    def set_feature(self, f, v, write=True):
-        """Used by profiles and the All slider: show v and send it if it differs."""
-        if write and self.values.get(f) != v and self.mon.bus:
-            self.mon.bus.write(f, v)
-        self.values[f] = v
-        self.apply_values()
-
-    def on_scale(self, scale, f):
-        if self.guard:
-            return
-        self.values[f] = int(scale.get_value())
-        self.mon.bus.write(f, self.values[f])
-        if f in GAINS:          # touching a gain flips many monitors into their User preset
-            self.mon.bus.read([PRESET], lambda vals, _m: self.set_values(vals, {}))
-        self.panel.values_changed()
-
-    def on_pick(self, f, code):
-        self.values[f] = code
-        self.mon.bus.write(f, code)
-        self.panel.values_changed()
-
-    def on_mute(self, btn):
-        if self.guard:
-            return
-        self.values[MUTE] = 1 if btn.get_active() else 2
-        self.mon.bus.write(MUTE, self.values[MUTE])
-
-    def snapshot(self):
-        """Profile entry for this monitor: the values worth restoring. RGB gains only when the
-        monitor is in its User preset, because writing gains flips the preset to User."""
-        feats = [f for f in PROFILE_SET if f in self.values and (self.caps is None or f in self.caps)]
-        if self.values.get(PRESET) not in (None, USER_PRESET):
-            feats = [f for f in feats if f not in GAINS]
-        return {f: self.values[f] for f in feats}
-
-    # --- header actions
     def display_name(self):
         return self.panel.config.get("names", {}).get(self.mon.key) or self.mon.model or self.mon.output or "Monitor"
 
-    def refresh_name(self):
-        self.name_lbl.set_text(self.display_name())
+    def has(self, feature):
+        return feature in self.values and (self.caps is None or feature in self.caps)
 
-    def rename(self, *_):
-        def done(text):
-            names = self.panel.config.setdefault("names", {})
-            if text:
-                names[self.mon.key] = text
-            else:
-                names.pop(self.mon.key, None)
-            self.panel.save_config()
-            self.refresh_name()
-        EntryPopover(self.name_btn, "Name for this monitor (empty = model name)", "Rename",
-                     done, text=self.panel.config.get("names", {}).get(self.mon.key, "")).show()
+    def snapshot(self):
+        """Preset entry for this monitor: the values worth restoring."""
+        return {f: self.values[f] for f in PROFILE_SET if self.has(f)}
 
-    def toggled(self, btn):
-        on = btn.get_active()
-        btn.get_child().set_from_icon_name("pan-down-symbolic" if on else "pan-end-symbolic",
-                                           Gtk.IconSize.BUTTON)
-        self.revealer.set_reveal_child(on)
-        expanded = set(self.panel.config.get("expanded", []))
-        (expanded.add if on else expanded.discard)(self.mon.key)
-        self.panel.config["expanded"] = sorted(expanded)
-        self.panel.save_config()
+
+class DeskMap(Gtk.DrawingArea):
+    """The desk, drawn to scale, and the brightness control itself. Each screen is filled
+    from the bottom as far as its brightness reaches, on the same notched scale as every
+    other screen, with its level as a number in the middle. Drag a screen up or down, or
+    scroll over it, to set it; click it to bring up its contrast and speaker below. The
+    line across a screen is where automatic brightness wants it, so a screen set by hand
+    shows the gap between the two."""
+
+    GAP, PX_PER_NOTCH = 4, 7
+
+    def __init__(self, panel, width):
+        super().__init__()
+        self.panel, self.width = panel, width
+        self.series = stops()
+        self.drag = None            # (screen, start y, start position, moved)
+        self.set_tooltip_text("Drag a screen up or down, or scroll over it, to set its brightness.\n"
+                              "Click it for contrast, speaker and power.\n"
+                              "The line across a screen is where automatic brightness wants it.")
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
+                        Gdk.EventMask.BUTTON1_MOTION_MASK | Gdk.EventMask.SCROLL_MASK |
+                        Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        self.connect("draw", self.on_draw)
+        self.connect("button-press-event", self.pressed)
+        self.connect("motion-notify-event", self.moved)
+        self.connect("button-release-event", self.released)
+        self.connect("scroll-event", self.scrolled)
+        set_cursor(self, "ns-resize")
+        self.fit()
+
+    def placed(self):
+        return [m for m in self.panel.monitors if m.placed]
+
+    def fit(self):
+        mons = self.placed()
+        if not mons:
+            self.set_size_request(self.width, 1)
+            return
+        x0, y0 = min(m.x for m in mons), min(m.y for m in mons)
+        bw = max(m.x + m.w for m in mons) - x0
+        bh = max(m.y + m.h for m in mons) - y0
+        self.k = min(self.width / bw, 230 / bh)
+        self.origin = (x0 - (self.width / self.k - bw) / 2, y0)
+        self.set_size_request(self.width, round(bh * self.k))
+        self.queue_draw()
+
+    def rect(self, m):
+        g = self.GAP / 2
+        return ((m.x - self.origin[0]) * self.k + g, (m.y - self.origin[1]) * self.k + g,
+                m.w * self.k - 2 * g, m.h * self.k - 2 * g)
+
+    def screen_at(self, px, py):
+        for m in self.placed():
+            x, y, w, h = self.rect(m)
+            if x <= px <= x + w and y <= py <= y + h:
+                return self.panel.screen_for(m)
+        return None
+
+    def on_draw(self, widget, cr):
+        fg, sel = theme_colours(widget)
+        n = len(self.series) - 1
+        for m in self.placed():
+            x, y, w, h = self.rect(m)
+            screen = self.panel.screen_for(m)
+            cr.rectangle(x, y, w, h)
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, .055)
+            cr.fill()
+            if screen is None or BRIGHTNESS not in screen.values:
+                draw_text(cr, widget, m.model or m.output, x + 7, y + 5, .85, alpha=.4)
+                continue
+            selected = screen is self.panel.selected
+            frac = pos_of(screen.values[BRIGHTNESS], self.series) / n
+            cr.rectangle(x, y + h * (1 - frac), w, h * frac)
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, .13)
+            cr.fill()
+            # the top of the fill is the level: give it an edge
+            cr.set_line_width(1.5)
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, .75)
+            ly = min(y + h - .75, max(y + .75, y + h * (1 - frac)))
+            cr.move_to(x, ly)
+            cr.line_to(x + w, ly)
+            cr.stroke()
+            # notches down the left edge, the same scale on every screen
+            cr.set_line_width(1)
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, .3)
+            for i in range(n + 1):
+                ty = round(y + h * (1 - i / n)) + (.5 if i < n else -.5) * (1 if i else -1)
+                cr.move_to(x, ty)
+                cr.line_to(x + 3, ty)
+            cr.stroke()
+            if screen.target is not None:
+                ty = round(y + h * (1 - pos_of(screen.target, self.series) / n)) + .5
+                ty = min(y + h - .5, max(y + .5, ty))
+                cr.set_source_rgba(sel.red, sel.green, sel.blue, 1)
+                cr.set_dash([3, 2])
+                cr.move_to(x, ty)
+                cr.line_to(x + w, ty)
+                cr.stroke()
+                cr.set_dash([])
+            if selected:
+                cr.set_line_width(1.5)
+                cr.set_source_rgba(sel.red, sel.green, sel.blue, 1)
+                cr.rectangle(x + .75, y + .75, w - 1.5, h - 1.5)
+                cr.stroke()
+            name = screen.display_name()
+            tw, th = draw_text(cr, widget, name, x + 8, y + 5, .85, bold=selected,
+                               alpha=.85 if selected else .6)
+            notes = [s for s in ("main" if screen.is_main else "", "pinned" if screen.pinned else "") if s]
+            if notes:
+                draw_text(cr, widget, " · ".join(notes), x + 8, y + 5 + th, .75,
+                          rgba=sel if screen.pinned else None, alpha=1 if screen.pinned else .45)
+            # the number rides on its level line (under it when the line is near the top)
+            big = widget.create_pango_layout("0")
+            desc = widget.get_pango_context().get_font_description().copy()
+            desc.set_size(int(desc.get_size() * 1.9))
+            big.set_font_description(desc)
+            bh = big.get_pixel_size()[1]
+            ny = ly - bh if ly - bh >= y + 34 else min(ly + 1, y + h - bh)
+            draw_text(cr, widget, str(screen.values[BRIGHTNESS]), x + w / 2, ny, 1.9, bold=True, align=.5)
+
+    # --- direct manipulation
+    def set_position(self, screen, position):
+        level = self.series[max(0, min(int(position), len(self.series) - 1))]
+        if level != screen.values.get(BRIGHTNESS):
+            self.panel.set_level(screen, BRIGHTNESS, level)
+
+    def pressed(self, _w, event):
+        screen = self.screen_at(event.x, event.y)
+        if screen and BRIGHTNESS in screen.values and event.button == 1:
+            self.drag = [screen, event.y, pos_of(screen.values[BRIGHTNESS], self.series), False]
+        return True
+
+    def moved(self, _w, event):
+        if not self.drag:
+            return True
+        screen, y0, start, _moved = self.drag
+        steps = round((y0 - event.y) / self.PX_PER_NOTCH)
+        if steps:
+            self.drag[3] = True
+            # from between two notches the first step lands on the nearer one in that direction
+            first = notch(start, 1 if steps > 0 else -1, self.series)
+            self.set_position(screen, first + steps - (1 if steps > 0 else -1))
+        elif self.drag[3]:
+            self.set_position(screen, round(start))
+        return True
+
+    def released(self, _w, event):
+        if self.drag:
+            self.panel.select(self.drag[0])
+        self.drag = None
+        self.panel.refresh_ambient()
+        return True
+
+    def scrolled(self, _w, event):
+        screen, step = self.screen_at(event.x, event.y), scroll_step(event)
+        if screen and step and BRIGHTNESS in screen.values:
+            self.set_position(screen, notch(pos_of(screen.values[BRIGHTNESS], self.series), step, self.series))
+        return True
 
 
 # ---------------------------------------------------------------- the panel
 
 class Panel(Gtk.Application):
+    WIDTH = 420
+
     def __init__(self):
         super().__init__(application_id=APP_ID)
         self.win = None
         self.closed_at = 0
-        self.monitors, self.rows, self.buses = [], [], {}
+        self.monitors, self.screens, self.buses = [], [], {}
+        self.selected = None
         self.config = load_json(CONFIG, {})
-        self.config.setdefault("profiles", DEFAULT_PROFILES)
+        self.config.setdefault("profiles", [])
+        self.ambient_status = load_json(str(STATUS), {})
+        self.pending, self.inflight = {}, set()      # requests to the service, per subject
+        self.local_levels = None                     # the day curve while it is being edited
+        self.ambient_tick = None
+        self.status_stamp = None
+        self.request_error = ""
+        self.chips = []
 
     def do_activate(self):
         if self.win is not None:          # second click on the panel button: close
@@ -665,11 +807,13 @@ class Panel(Gtk.Application):
 
     # --- window
     def build(self):
+        self.config = load_json(CONFIG, self.config)
+        self.ambient_status = load_json(str(STATUS), {})
         self.hold()
         css = Gtk.CssProvider()
         css.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
-                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
         win = self.win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
         win.set_title("Monitors")
         win.set_decorated(False)
@@ -687,53 +831,149 @@ class Panel(Gtk.Application):
                     lambda w, e: self.close() if e.keyval == Gdk.KEY_Escape else None)
         win.connect("size-allocate", lambda *_: self.place())
 
-        frame = Gtk.Frame()
-        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self.box.set_border_width(10)
-        self.box.set_size_request(430, -1)
-        frame.add(self.box)
-        win.add(frame)
+        # The surface paints its own background and a one-pixel hairline in the theme's
+        # border colour, so nothing of the bare X window shows around it.
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.box.get_style_context().add_class("mp-surface")
+        self.box.set_size_request(self.WIDTH + 34, -1)
+        win.add(self.box)
 
-        head = Gtk.Box(spacing=6)
-        title = Gtk.Label(xalign=0)
-        title.set_markup("<b>Monitors</b>")
-        head.pack_start(title, False, False, 4)
-        self.profile_bar = Gtk.Box()
-        self.profile_bar.get_style_context().add_class("linked")
-        head.pack_end(self.profile_bar, False, False, 0)
-        self.box.pack_start(head, False, False, 0)
+        # 1. The mode: three words, the current one underlined.
+        self.mode_bar = Gtk.Box(spacing=18)
+        self.mode_btns = {}
+        for mode, text, tip in MODES:
+            b = Gtk.Button(label=text)
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            b.get_style_context().add_class("mp-tab")
+            b.set_tooltip_text(tip)
+            b.connect("clicked", lambda _b, m=mode: self.control({"op": "mode", "mode": m}))
+            self.mode_bar.pack_start(b, False, False, 0)
+            self.mode_btns[mode] = b
+        self.box.pack_start(self.mode_bar, False, False, 0)
 
-        self.rows_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        scroller = Gtk.ScrolledWindow()      # four expanded rows outgrow a 1080-high screen
-        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroller.set_propagate_natural_height(True)
-        scroller.set_overlay_scrolling(True)
-        scroller.add(self.rows_box)
-        self.box.pack_start(scroller, True, True, 0)
+        # 2. One sentence for what that means now; today's curve; the four numbers that make it.
+        self.ambient_label = Gtk.Label(label="Checking automatic brightness…", xalign=0)
+        self.ambient_label.get_style_context().add_class("mp-status")
+        self.ambient_label.set_line_wrap(True)
+        self.ambient_label.set_max_width_chars(52)
+        self.box.pack_start(self.ambient_label, False, False, 0)
+        self.error_label = Gtk.Label(xalign=0)
+        self.error_label.get_style_context().add_class("mp-warn")
+        self.error_label.set_line_wrap(True)
+        self.error_label.set_max_width_chars(58)
+        self.error_label.set_no_show_all(True)
+        self.box.pack_start(self.error_label, False, False, 0)
+        self.day_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.day = DayCurve(self)
+        self.day.set_margin_top(8)
+        self.day_box.pack_start(self.day, False, False, 0)
+        anchors = Gtk.Box(spacing=0)
+        self.scrubs = {}
+        tips = {"Night": "Brightness in a dark room, with the sun well below the horizon.",
+                "Evening": "Brightness in twilight, or on a very dark overcast day.",
+                "Dusk": "Brightness with the sun at the horizon, or on a dull day.",
+                "Day": "Brightness in full daylight."}
+        for i, phase in enumerate(PHASES):
+            cell = Gtk.Box(spacing=5)
+            cell.pack_start(dim_label(phase.lower()), False, False, 0)
+            scrub = Scrub(self.levels()[phase], lambda v, p=phase: self.on_anchor(p, v), tip=tips[phase])
+            self.scrubs[phase] = scrub
+            cell.pack_start(scrub, False, False, 0)
+            anchors.pack_start(cell, False, False, 0)
+            if i < len(PHASES) - 1:
+                anchors.pack_start(dim_label("  →  "), False, False, 0)
+        self.day_box.pack_start(anchors, False, False, 0)
+        self.box.pack_start(self.day_box, False, False, 0)
 
-        foot = Gtk.Box(spacing=8)
-        foot.pack_start(dim_label("All"), False, False, 4)
-        self.all_scale = make_scale()
+        # 3. The control that belongs to the current mode. Only Game has one.
+        self.game_box = Gtk.Revealer()
+        self.game_box.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        game = Gtk.Box(spacing=8)
+        game.set_margin_top(8)
+        self.tone = ToneCurve()
+        game.pack_start(self.tone, False, False, 0)
+        name = Gtk.Label(label="Shadows", xalign=0)
+        name.get_style_context().add_class("mp-name")
+        game.pack_start(name, False, False, 0)
+        self.shadow_scale = StopScale(100, start=10, fmt=lambda v: "off" if v < 1 else f"{v}%")
+        self.shadow_scale.set_tooltip_text(
+            "How far dark areas are brightened on the main screen while in Game.\n"
+            "Only shadows move: midtones, highlights and colours stay as they are.")
+        self.shadow_scale.connect("value-changed", self.on_shadows)
+        game.pack_start(self.shadow_scale, True, True, 0)
+        self.game_box.add(game)
+        self.box.pack_start(self.game_box, False, False, 0)
+
+        # 4. Saved presets, only when there are any.
+        self.profile_bar = Gtk.Box(spacing=12)
+        self.profile_bar.set_margin_top(6)
+        self.profile_bar.set_no_show_all(True)
+        self.box.pack_start(self.profile_bar, False, False, 0)
+
+        # 5. The desk: every screen where it stands, each one its own brightness control.
+        self.map = DeskMap(self, self.WIDTH)
+        self.map.set_margin_top(12)
+        self.box.pack_start(self.map, False, False, 0)
+        self.note_lbl = Gtk.Label(xalign=0)
+        self.note_lbl.get_style_context().add_class("mp-dim")
+        self.note_lbl.set_no_show_all(True)
+        self.box.pack_start(self.note_lbl, False, False, 0)
+
+        allrow = Gtk.Box(spacing=0)
+        allrow.set_margin_top(6)
+        all_lbl = Gtk.Label(label="All", xalign=0)
+        all_lbl.get_style_context().add_class("mp-name")
+        all_lbl.set_size_request(64, -1)
+        allrow.pack_start(all_lbl, False, False, 0)
+        self.all_scale = StopScale()
         self.all_scale.set_sensitive(False)
-        self.all_scale.set_tooltip_text("Brightness of every monitor at once")
+        self.all_scale.set_tooltip_text("Every screen together, each at the value that looks like this on the main one")
         self.all_scale.connect("value-changed", self.on_all)
-        foot.pack_start(self.all_scale, True, True, 0)
-        refresh = Gtk.Button()
-        refresh.set_relief(Gtk.ReliefStyle.NONE)
-        refresh.add(icon("view-refresh-symbolic"))
-        refresh.set_tooltip_text("Re-detect monitors and re-read their settings")
-        refresh.connect("clicked", lambda *_: self.detect(force=True))
-        foot.pack_end(refresh, False, False, 0)
+        allrow.pack_start(self.all_scale, True, True, 0)
+        self.box.pack_start(allrow, False, False, 0)
+
+        # 6. The screen you clicked: the things you touch less often.
+        self.detail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.detail.get_style_context().add_class("mp-detail")
+        self.box.pack_start(self.detail, False, False, 0)
+        self.controls = {}
+
+        # 7. Quiet housekeeping.
+        foot = Gtk.Box(spacing=4)
+        foot.get_style_context().add_class("mp-foot")
+        self.match_btn = link_button(
+            "These look equally bright → remember",
+            "Set the screens by eye until they look the same, then press this.\n"
+            "From then on automatic brightness and the All slider keep them looking alike.\n"
+            "Do it once dim and once bright and the match holds across the range.",
+            self.remember_match)
+        foot.pack_start(self.match_btn, False, False, 0)
+
+        def flat(icon_name, tip, cb):
+            b = Gtk.Button()
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            b.get_style_context().add_class("mp-arrow")
+            b.add(icon(icon_name, Gtk.IconSize.MENU))
+            b.set_tooltip_text(tip)
+            b.connect("clicked", cb)
+            return b
+        foot.pack_end(flat("view-refresh-symbolic", "Re-detect monitors and re-read their settings",
+                           lambda *_: self.detect(force=True)), False, False, 0)
+        foot.pack_end(flat("list-add-symbolic", "Save the current settings of every screen as a preset",
+                           self.add_profile), False, False, 0)
+        self.unpin_all = link_button("unpin all", "Let every hand-set screen follow the light again",
+                                     lambda *_: self.control({"op": "release", "key": "all"}))
+        self.unpin_all.set_no_show_all(True)
+        foot.pack_end(self.unpin_all, False, False, 8)
         self.box.pack_start(foot, False, False, 0)
         self.guard = False
-        self.note_lbl = None
 
         display = Gdk.Display.get_default()
         _, px, py = display.get_default_seat().get_pointer().get_position()
         self.anchor = (px, py)
-        screen_h = display.get_monitor_at_point(px, py).get_geometry().height
-        scroller.set_max_content_height(screen_h - 150)
         self.build_profile_bar()
+        self.refresh_ambient()
+        self.ambient_tick = GLib.timeout_add(1000, self.refresh_ambient)
 
         problem = ddc_problem()
         if problem:
@@ -745,13 +985,9 @@ class Panel(Gtk.Application):
         win.present()
 
     def note(self, text, selectable=False):
-        if self.note_lbl:
-            self.note_lbl.destroy()
-        self.note_lbl = Gtk.Label(label=text, xalign=0)
+        self.note_lbl.set_text(text or "")
         self.note_lbl.set_selectable(selectable)
-        self.note_lbl.get_style_context().add_class("mp-dim")
-        self.rows_box.pack_start(self.note_lbl, False, False, 0)
-        self.note_lbl.show()
+        self.note_lbl.set_visible(bool(text))
 
     def place(self):
         # Open by the pointer (that is where the panel button is), kept inside its monitor.
@@ -772,8 +1008,11 @@ class Panel(Gtk.Application):
             return
         self.win.destroy()
         self.win = None
+        if self.ambient_tick:
+            GLib.source_remove(self.ambient_tick)
+            self.ambient_tick = None
         self.closed_at = time.monotonic()
-        # Linger briefly so a ddcutil write still in flight finishes and a quick re-click is seen.
+        # Linger briefly so a write still in flight finishes and a quick re-click is seen.
         GLib.timeout_add(1500, lambda: self.release() or False)
 
     # --- monitors
@@ -800,12 +1039,8 @@ class Panel(Gtk.Application):
         run_async(["ddcutil", "detect"], found)
 
     def populate(self, ddc, outputs):
-        for row in self.rows:
-            row.destroy()
-        if self.note_lbl:
-            self.note_lbl.destroy()
-            self.note_lbl = None
-        self.monitors, self.rows = [], []
+        self.note("")
+        self.monitors, self.screens = [], []
         by_key = {o["key"]: o for o in outputs if o["key"]}
         for key, d in ddc.items():
             o = by_key.get(key)
@@ -813,7 +1048,7 @@ class Panel(Gtk.Application):
             self.monitors.append(Monitor(
                 key, bus, (o and o["model"]) or d.get("model") or "", d.get("connector", ""),
                 (o["x"], o["y"], o["w"], o["h"]) if o else None, o["name"] if o else ""))
-        for o in outputs:                   # outputs without DDC still take part in the minimap
+        for o in outputs:                   # outputs without DDC still take their place on the desk
             if o["key"] not in ddc:
                 self.monitors.append(Monitor(o["key"] or o["name"], None, o["model"], "",
                                              (o["x"], o["y"], o["w"], o["h"]), o["name"]))
@@ -821,29 +1056,33 @@ class Panel(Gtk.Application):
         for m in self.monitors:
             if m.bus is None:
                 continue
-            row = MonitorRow(self, m)
-            self.rows.append(row)
-            self.rows_box.pack_start(row, False, False, 0)
-            self.load_caps(row)
-            feats = [f for f in READ_SET if row.caps is None or f in row.caps]
-            m.bus.read(feats, row.set_values)
-        if not self.rows:
+            screen = Screen(self, m)
+            self.screens.append(screen)
+            self.load_caps(screen)
+            feats = [f for f in READ_SET if screen.caps is None or f in screen.caps]
+            m.bus.read(feats, lambda vals, maxes, s=screen: self.got_values(s, vals, maxes))
+        if not self.screens:
             self.note("no DDC monitors found\n(DDC/CI may be off in a monitor's own menu)")
-        self.rows_box.show_all()
-        self.values_changed()
+        self.map.fit()
+        self.status_stamp = None
+        self.select(next((s for s in self.screens if s.is_main), self.screens[0] if self.screens else None))
+        self.refresh_ambient()
 
-    def load_caps(self, row):
-        path = row.mon.caps_path()
+    def screen_for(self, mon):
+        return next((s for s in self.screens if s.mon is mon), None)
+
+    def load_caps(self, screen):
+        path = screen.mon.caps_path()
         try:
             with open(path) as f:
-                row.build_details(parse_caps(f.read()))
+                screen.caps = parse_caps(f.read())
             return
         except OSError:
             pass
 
         def got(text):
             caps = parse_caps(text)
-            if not caps or row.get_parent() is None:
+            if not caps or screen not in self.screens:
                 return
             try:
                 os.makedirs(CACHE, exist_ok=True)
@@ -851,61 +1090,393 @@ class Panel(Gtk.Application):
                     f.write(text)
             except OSError:
                 pass
-            row.build_details(caps)
-        row.mon.bus.capabilities(got)
+            screen.caps = caps
+            if screen is self.selected:
+                self.select(screen)
+        screen.mon.bus.capabilities(got)
 
-    # --- the All slider
+    def got_values(self, screen, vals, maxes):
+        if self.win is None or screen not in self.screens:
+            return
+        if self.busy():                    # never pull a control out from under the hand
+            vals = {f: v for f, v in vals.items() if f not in (BRIGHTNESS, CONTRAST)}
+        screen.values.update(vals)
+        screen.maxes.update(maxes)
+        self.values_changed()
+
+    # --- the selected screen's details
+    def select(self, screen):
+        self.selected = screen
+        for child in self.detail.get_children():
+            child.destroy()
+        self.controls = {}
+        if screen is None:
+            return
+        head = Gtk.Box(spacing=6)
+        name_btn = Gtk.Button(label=screen.display_name())
+        name_btn.set_relief(Gtk.ReliefStyle.NONE)
+        name_btn.get_style_context().add_class("mp-namebtn")
+        name_btn.set_tooltip_text("Rename this monitor")
+        name_btn.connect("clicked", lambda b: self.rename(screen, b))
+        head.pack_start(name_btn, False, False, 0)
+        where = " · ".join(x for x in (position_word(screen.mon, self.monitors),
+                                       "main" if screen.is_main else "") if x)
+        where_lbl = dim_label(where)
+        where_lbl.set_tooltip_text(screen.mon.output)
+        head.pack_start(where_lbl, False, False, 0)
+        if screen.caps is None or POWER in screen.caps:
+            head.pack_end(link_button("turn off", "Switches this monitor off (DDC power mode). "
+                                      "Wake it with its own power button.",
+                                      lambda *_: screen.mon.bus.write(POWER, 4)), False, False, 0)
+        self.pin_btn = link_button("pinned · unpin", "You set this screen by hand, so it stays there.\n"
+                                   "Unpin to let it follow the light again.",
+                                   lambda *_: self.control({"op": "release", "key": screen.mon.key}))
+        self.pin_btn.set_no_show_all(True)
+        head.pack_end(self.pin_btn, False, False, 8)
+        self.detail.pack_start(head, False, False, 0)
+
+        def line(text, feature):
+            row = Gtk.Box(spacing=0)
+            lbl = dim_label(text)
+            lbl.set_size_request(64, -1)
+            row.pack_start(lbl, False, False, 0)
+            # A monitor whose firmware mishandles a remote setting (config.json "quirks"):
+            # the HKC adds 78 to a contrast sent by the computer and lets it run past its
+            # own menu's 100. Send only what stays inside the menu, and show the menu's number.
+            quirk = self.config.get("quirks", {}).get(screen.mon.key, {}).get(feature, {})
+            shift = quirk.get("shown_offset", 0)
+            scale = StopScale(quirk.get("max", 100), fmt=lambda v: str(v + shift))
+            if quirk:
+                top = quirk.get("max", 100)
+                scale.set_tooltip_text(
+                    f"Shown as in this monitor's own menu. Its firmware only lets the computer set "
+                    f"{shift}–{shift + top}; lower values exist only on the monitor's buttons.")
+            scale.set_sensitive(False)
+            scale.connect("value-changed", self.on_detail_scale, feature)
+            self.controls[feature] = scale
+            row.pack_start(scale, True, True, 0)
+            self.detail.pack_start(row, False, False, 0)
+            return row
+        if screen.caps is None or CONTRAST in screen.caps:
+            line("contrast", CONTRAST)
+        if screen.caps and VOLUME in screen.caps:
+            row = line("speaker", VOLUME)
+            if MUTE in screen.caps:
+                mute = Gtk.ToggleButton()
+                mute.set_relief(Gtk.ReliefStyle.NONE)
+                mute.get_style_context().add_class("mp-arrow")
+                mute.add(icon("audio-volume-muted-symbolic", Gtk.IconSize.MENU))
+                mute.set_tooltip_text("Mute")
+                mute.connect("toggled", self.on_mute)
+                row.pack_start(mute, False, False, 0)
+                self.controls[MUTE] = mute
+        foot = Gtk.Box(spacing=10)
+        self.match_lbl = dim_label("")
+        self.match_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        foot.pack_start(self.match_lbl, False, False, 0)
+        self.forget_btn = link_button("forget", "Drop what was remembered about how this screen compares to the main one",
+                                      lambda *_: self.control({"op": "match", "forget": screen.mon.key}))
+        self.forget_btn.set_no_show_all(True)
+        foot.pack_start(self.forget_btn, False, False, 0)
+        self.detail.pack_start(foot, False, False, 0)
+        self.detail.show_all()
+        self.status_stamp = None
+        self.values_changed()
+        if self.win is not None:
+            self.refresh_ambient()
+
+    def rename(self, screen, button):
+        def done(text):
+            names = self.config.setdefault("names", {})
+            if text:
+                names[screen.mon.key] = text
+            else:
+                names.pop(screen.mon.key, None)
+            self.save_config()
+            self.select(screen)
+        EntryPopover(button, "Name for this monitor (empty = model name)", "Rename",
+                     done, text=self.config.get("names", {}).get(screen.mon.key, "")).show()
+
+    def on_detail_scale(self, scale, feature):
+        if not self.guard and self.selected:
+            level = scale.get_level()
+            if level != self.selected.values.get(feature):
+                self.set_level(self.selected, feature, level)
+
+    def on_mute(self, btn):
+        if not self.guard and self.selected:
+            self.selected.values[MUTE] = 1 if btn.get_active() else 2
+            self.selected.mon.bus.write(MUTE, self.selected.values[MUTE])
+
+    # --- setting levels
+    def set_level(self, screen, feature, level, tell=True):
+        """Show a new level and send it. Brightness and contrast go through the brightness
+        service when it runs: it is then the only writer, so nothing pushes an older value
+        back, and it holds the level instead of steering back to automatic."""
+        screen.values[feature] = level
+        if feature in (BRIGHTNESS, CONTRAST) and self.automation_available():
+            if tell:
+                self.queue_control(screen.mon.key + feature, {
+                    "op": "set", "key": screen.mon.key, "values": {feature: level}})
+        elif screen.mon.bus:
+            screen.mon.bus.write(feature, level)
+        self.values_changed()
+
+    def main_screen(self):
+        return next((s for s in self.screens if s.is_main), None)
+
+    def match_table(self):
+        return self.ambient_status.get("match", {}) if self.automation_available() else {}
+
+    def looks_like(self, screen, level):
+        """The value on this monitor that looks like `level` on the main one."""
+        return level if screen.is_main else matched(level, self.match_table().get(screen.mon.key))
+
+    def remember_match(self, *_):
+        main = self.main_screen()
+        if main is None or BRIGHTNESS not in main.values:
+            return
+        self.control({"op": "match", "level": main.values[BRIGHTNESS], "points": {
+            s.mon.key: s.values[BRIGHTNESS] for s in self.screens
+            if not s.is_main and BRIGHTNESS in s.values}})
+
     def on_all(self, scale):
         if self.guard:
             return
-        v = int(scale.get_value())
-        for row in self.rows:
-            if BRIGHTNESS in row.values:
-                row.set_feature(BRIGHTNESS, v)
-        self.values_changed()
+        level = scale.get_level()
+        table = {}
+        for screen in self.screens:
+            if BRIGHTNESS in screen.values:
+                table[screen.mon.key] = self.looks_like(screen, level)
+                self.set_level(screen, BRIGHTNESS, table[screen.mon.key], tell=False)
+        if table and self.automation_available():
+            self.queue_control("all", {"op": "levelset", "monitors": table})
+        self.values_changed(from_all=True)
 
-    def values_changed(self):
+    def on_shadows(self, scale):
+        self.tone.set_level(scale.get_level())
+        if not self.guard:
+            self.queue_control("shadows", {"op": "shadows", "value": scale.get_level()})
+
+    def levels(self):
+        """The four anchors of the day curve: being edited, from the service, or the defaults."""
+        return self.local_levels or {**LEVELS, **self.ambient_status.get("levels", {})}
+
+    def auto_level(self):
+        return self.ambient_status.get("level") if self.automation_available() else None
+
+    def on_anchor(self, phase, value):
+        levels = dict(self.levels())
+        levels[phase] = value
+        i = PHASES.index(phase)
+        for p in PHASES[:i]:                 # brighter light never means a darker screen:
+            levels[p] = min(levels[p], value)       # neighbours move out of the way
+        for p in PHASES[i + 1:]:
+            levels[p] = max(levels[p], value)
+        self.local_levels = levels
+        for p, scrub in self.scrubs.items():
+            scrub.show_value(levels[p])
+        self.day.queue_draw()
+        self.queue_control("levels", {"op": "levels", "values": levels})
+
+    def values_changed(self, from_all=False):
+        """Bring every drawing and control in line with the values, writing nothing."""
         if self.win is None:
             return
-        known = [r.values[BRIGHTNESS] for r in self.rows if BRIGHTNESS in r.values]
+        known = [s.values[BRIGHTNESS] for s in self.screens if BRIGHTNESS in s.values]
+        main = self.main_screen()
         self.guard = True
         try:
             self.all_scale.set_sensitive(bool(known))
-            if known:
-                self.all_scale.set_value(round(sum(known) / len(known)))
+            if known and not from_all:
+                # All speaks the main monitor's scale when there is one, else the average.
+                self.all_scale.set_level(main.values[BRIGHTNESS] if main and BRIGHTNESS in main.values
+                                         else round(sum(known) / len(known)))
+            screen = self.selected
+            for feature, w in self.controls.items():
+                known_here = screen is not None and feature in screen.values
+                w.set_sensitive(known_here)
+                if not known_here:
+                    continue
+                if isinstance(w, StopScale):
+                    quirk = self.config.get("quirks", {}).get(screen.mon.key, {}).get(feature, {})
+                    w.set_max(min(screen.maxes.get(feature, 100), quirk.get("max", 100)))
+                    w.set_level(screen.values[feature])
+                else:
+                    w.set_active(screen.values[feature] == 1)
         finally:
             self.guard = False
+        self.map.queue_draw()
         for chip, profile in self.chips:
             ctx = chip.get_style_context()
-            if self.profile_matches(profile):
-                ctx.add_class("suggested-action")
-            else:
-                ctx.remove_class("suggested-action")
+            (ctx.add_class if self.profile_matches(profile) else ctx.remove_class)("mp-on")
 
-    # --- profiles
-    def profile_entry(self, profile, row):
-        return profile.get("monitors", {}).get(row.mon.key) or profile.get("any")
+    # --- talking to the brightness service
+    def automation_available(self):
+        return bool(self.config.get("ambient", {}).get("enabled")) and \
+            time.time() - self.ambient_status.get("updated_at", 0) < 120
+
+    def busy(self):
+        """True while a change of ours is on its way, or a screen is being dragged."""
+        return bool(self.pending or self.inflight or (self.win and self.map.drag))
+
+    def queue_control(self, subject, payload):
+        """Latest value wins: while one request about a subject is in flight, newer ones
+        replace each other and the last is sent as soon as the answer is back. A drag
+        therefore reaches the monitor as fast as it can take it, and never out of order."""
+        self.pending[subject] = payload
+        if subject not in self.inflight:
+            self.flush(subject)
+
+    def flush(self, subject):
+        self.inflight.add(subject)
+
+        def after():
+            self.inflight.discard(subject)
+            if subject in self.pending:
+                self.flush(subject)
+        self.control(self.pending.pop(subject), after)
+
+    def control(self, payload, after=None):
+        if payload.get("op") in ("mode", "release", "match"):
+            self.pending.clear()
+        self.status_stamp = None          # take the service's answer even within the same round
+
+        def done(result):
+            if after:
+                after()
+            if self.win is None:
+                return False
+            self.request_error = result.get("error") or "; ".join(result.get("errors") or [])
+            if payload.get("op") == "levels" and "levels" not in self.pending:
+                self.local_levels = None
+            self.refresh_ambient()
+            return False
+
+        def work():
+            try:
+                result = service_request(payload)
+            except (OSError, ValueError, RuntimeError) as e:
+                result = {"error": str(e) or "the brightness service is not answering"}
+            GLib.idle_add(done, result)
+        threading.Thread(target=work, daemon=True).start()
+
+    def refresh_ambient(self):
+        """Mode, sentence, pins, matches, the day curve and the Game control from the
+        service's status file."""
+        if self.win is None:
+            return False
+        status = load_json(str(STATUS), {})
+        self.ambient_status = status
+        alive = bool(status) and time.time() - status.get("updated_at", 0) <= 120
+        managed = bool(self.config.get("ambient", {}).get("enabled"))
+        self.mode_bar.set_visible(managed)
+        self.mode_bar.set_sensitive(alive)
+        self.day_box.set_visible(managed)
+        self.day_box.set_sensitive(alive)
+        self.day.queue_draw()
+        if not self.local_levels:
+            for phase, scrub in self.scrubs.items():
+                scrub.show_value(self.levels()[phase])
+        overrides = status.get("overrides", {}) if alive else {}
+        main = status.get("main_monitor")
+        mode = overrides.get(main, {}).get("mode", "auto")
+        if mode not in self.mode_btns:
+            mode = "auto"
+        for m, b in self.mode_btns.items():
+            ctx = b.get_style_context()
+            (ctx.add_class if alive and m == mode else ctx.remove_class)("mp-on")
+        pinned = {k for k, e in overrides.items() if e.get("mode") == "manual" or e.get("values")}
+        level = status.get("level") if alive else None
+        table = status.get("match", {}) if alive else {}
+        for screen in self.screens:
+            screen.pinned = screen.mon.key in pinned
+            screen.target = None if level is None else self.looks_like(screen, level)
+        self.all_scale.set_target(level)
+        self.unpin_all.set_visible(len(pinned) > 1)
+        self.match_btn.set_visible(alive and self.main_screen() is not None and len(self.screens) > 1)
+        self.game_box.set_reveal_child(alive and mode == "game")
+        sel = self.selected
+        if sel is not None:
+            self.pin_btn.set_visible(sel.pinned)
+            points = table.get(sel.mon.key)
+            if sel.is_main:
+                text = "the other screens are matched to this one"
+            elif points:
+                text = "looks like main: " + ", ".join(f"{v} here = {l}" for l, v in points)
+            else:
+                text = "not matched to main yet"
+            self.match_lbl.set_text(text if alive else "")
+            self.forget_btn.set_visible(bool(points) and not sel.is_main)
+
+        errors = [e for e in [self.request_error] + (status.get("errors") or []) if e]
+        self.error_label.set_text(errors[0] if errors else "")
+        self.error_label.set_visible(bool(errors))
+        if not managed:
+            self.ambient_label.set_text("Manual brightness")
+            self.ambient_label.set_tooltip_text(None)
+        elif not alive:
+            self.ambient_label.set_text("Automatic brightness is not running · the controls still work")
+            self.ambient_label.set_tooltip_text("systemctl --user status monitor-ambient")
+        else:
+            room = f"the light, {level}%" if level is not None else "the light"
+            text = f"Following {room}" if mode == "auto" else \
+                f"{mode.title()} on the main screen · the rest follow {room}"
+            if any(not m.get("settled") for m in status.get("monitors", {}).values()) and not pinned:
+                text += " · easing in"
+            self.ambient_label.set_text(text)
+            light = status.get("light", {})
+            source = light.get("source", "Unknown light source")
+            if "lux" in light:
+                source += f", {light['lux']:.1f} lux"
+            elif "radiation" in light:
+                source += f", {light['radiation']:.0f} W/m²"
+            self.ambient_label.set_tooltip_text(
+                f"Light reading: {source} → {status.get('level_exact', level)}%\n"
+                "Brightness glides between the four levels under the curve; contrast stays at 20%.\n"
+                "Setting a screen by hand pins it until you unpin it.\n"
+                "Weather estimates: Open-Meteo (CC BY 4.0), https://open-meteo.com/")
+
+            stamp = (status.get("updated_at"), status.get("requested_revision"))
+            if stamp != self.status_stamp and not self.busy():
+                if not status.get("pending"):
+                    for screen in self.screens:
+                        actual = status.get("monitors", {}).get(screen.mon.key, {}).get("values")
+                        if actual:
+                            screen.values.update(actual)
+                self.guard = True
+                try:
+                    self.shadow_scale.set_level(status.get("shadows", 40))
+                finally:
+                    self.guard = False
+                self.status_stamp = stamp
+        self.values_changed()
+        return True
+
+    # --- presets
+    def profile_entry(self, profile, screen):
+        return profile.get("monitors", {}).get(screen.mon.key) or profile.get("any")
 
     def profile_matches(self, profile):
         covered = False
-        for row in self.rows:
-            entry = self.profile_entry(profile, row)
+        for screen in self.screens:
+            entry = self.profile_entry(profile, screen)
             if not entry:
                 continue
             covered = True
             for f, v in entry.items():
-                if f not in row.values or row.values[f] != v:
+                if f in PROFILE_SET and screen.values.get(f) != v:
                     return False
         return covered
 
     def apply_profile(self, profile):
-        for row in self.rows:
-            entry = self.profile_entry(profile, row)
-            if not entry:
-                continue
-            for f in PROFILE_SET:           # brightness/contrast/preset before gains
-                if f in entry and (row.caps is None or f in row.caps):
-                    row.set_feature(f, int(entry[f]))
+        entries = {s: self.profile_entry(profile, s) for s in self.screens if self.profile_entry(profile, s)}
+        if self.automation_available():
+            self.control({"op": "hold", "monitors": {s.mon.key: e for s, e in entries.items()}})
+        for screen, entry in entries.items():
+            for f in PROFILE_SET:
+                if f in entry and (screen.caps is None or f in screen.caps):
+                    self.set_level(screen, f, int(entry[f]), tell=False)
         self.values_changed()
 
     def build_profile_bar(self):
@@ -913,20 +1484,20 @@ class Panel(Gtk.Application):
             c.destroy()
         self.chips = []
         for profile in self.config["profiles"]:
+            if profile.get("mode"):         # Movie/Game are modes now, not presets
+                continue
             chip = Gtk.Button(label=profile["name"])
-            chip.get_style_context().add_class("mp-chip")
-            chip.set_tooltip_text("Apply · right-click to edit")
+            chip.set_relief(Gtk.ReliefStyle.NONE)
+            chip.get_style_context().add_class("mp-tab")
+            chip.get_style_context().add_class("mp-preset")
+            chip.set_tooltip_text("Apply this preset · right-click to rename, update or delete")
             chip.connect("clicked", lambda _b, p=profile: self.apply_profile(p))
             chip.connect("button-press-event", self.chip_pressed, profile)
             self.profile_bar.pack_start(chip, False, False, 0)
             self.chips.append((chip, profile))
-        add = Gtk.Button()
-        add.add(icon("list-add-symbolic"))
-        add.set_tooltip_text("Save the current settings as a new profile")
-        add.connect("clicked", self.add_profile)
-        self.profile_bar.pack_start(add, False, False, 0)
-        self.profile_bar.show_all()
-        self.values_changed()
+        for chip, _p in self.chips:
+            chip.show()
+        self.profile_bar.set_visible(bool(self.chips))
 
     def add_profile(self, btn):
         def done(name):
@@ -936,10 +1507,11 @@ class Panel(Gtk.Application):
             self.config["profiles"].append({"name": name, "monitors": self.snapshot()})
             self.save_config()
             self.build_profile_bar()
+            self.values_changed()
         EntryPopover(btn, "Save the current settings as", "Save", done).show()
 
     def snapshot(self):
-        return {row.mon.key: row.snapshot() for row in self.rows if row.snapshot()}
+        return {s.mon.key: s.snapshot() for s in self.screens if s.snapshot()}
 
     def chip_pressed(self, chip, event, profile):
         if event.button != 3:
@@ -950,6 +1522,7 @@ class Panel(Gtk.Application):
                 profile["name"] = name
                 self.save_config()
                 self.build_profile_bar()
+                self.values_changed()
 
         def update():
             profile.pop("any", None)
@@ -961,9 +1534,9 @@ class Panel(Gtk.Application):
             self.config["profiles"].remove(profile)
             self.save_config()
             self.build_profile_bar()
-        EntryPopover(chip, "Profile name", "Rename", rename, text=profile["name"],
+        EntryPopover(chip, "Preset name", "Rename", rename, text=profile["name"],
                      extra=[("Update with the current settings", update),
-                            ("Delete this profile", delete)]).show()
+                            ("Delete this preset", delete)]).show()
         return True
 
 
